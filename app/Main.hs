@@ -200,9 +200,10 @@ printLogisim file = do
 simulate :: State CPUState [Result]
 simulate = gets rightInss >>= \case
     []         -> return []
-    (Halt : _) -> return []
+    -- (Halt : _) -> return []
     (i : _)   ->
-      unsafeIncIns >> eval i >> putLI i >> gets newSimResult >>= (<$> simulate) . (:)
+      unsafeIncIns >> eval i >> putLI i >> gets newSimResult >>= (<$> case i of Halt -> return []
+                                                                                _    -> simulate) . (:)
   where
     unsafeIncIns :: State CPUState ()
     unsafeIncIns = modify' $ \s@(CPUState _ ls (r:rs) _ _ _) -> s {leftInss = r : ls, rightInss = rs}
@@ -342,36 +343,64 @@ prettyReg RegD = "d"
 prettyConst :: Constant -> String
 prettyConst (Constant c) = "0x" ++ nChar '0' 2 (showHex c " ; u: ") ++ show c ++ " ; s: " ++ sign c
 
+prettyResults :: Charset -> [Result] -> String
+prettyResults chs = tblines . concatMap (prettyResult chs)
+  where tblines s = topLine ++ s ++ botLine
+        topLine = ansiForeground chs Cyan $ "┌" ++ replicate 45 '─' ++ "┐\n"
+        botLine = ansiForeground chs Cyan $ "└" ++ replicate 45 '─' ++ "┘"
+
+ansiAttribute :: Charset -> AnsiAttribute -> String -> String
+ansiAttribute chs attr = ansiNumber chs $ fromEnum attr
+
+ansiForeground :: Charset -> AnsiColor -> String -> String
+ansiForeground chs col = ansiNumber chs  (30 +  fromEnum col)
+
+ansiNumber :: Charset -> Int -> String -> String
+ansiNumber chs = ansiCustom chs . show
+
+ansiCustom :: Charset -> String -> String -> String
+ansiCustom chs fmt s = case chs of ANSI -> "\ESC[" ++ fmt ++ "m" ++ s ++ "\ESC[m"
+                                   _    -> s
+
 prettyResult :: Charset -> Result -> String
 prettyResult chs (Result li regs ls) =
   line ++ lastI ++ regLine True ++ regsHex ++ regsU ++ regsDec ++ regLine False ++ diodes
   where
-    lastI = maybe "Initial State:\n" (\i -> "Current Instruction: " ++ instruction i ++ "\n") li
+    lastI = br (44 - length lastI' + if isJust li then length (ansiAttr Bold $ ansiFg White "") else 0) $ bl lastI'
+    lastI' = maybe "Initial State:" (\i -> "Instruction: " ++ instruction i) li
     instruction = ansiFg Red . ansiAttr Bold . prettyIns
-    regLine isTop = intercalate "  " (replicate (length regs) $ oneReg isTop) ++ "\n"
-    ansiAttr attr = ansiNum $ fromEnum attr
-    ansiFg col = ansiNum (30 +  fromEnum col)
-    ansiNum = ansiCustom . show
-    ansiCustom fmt s = case chs of ANSI -> "\ESC[" ++ fmt ++ "m" ++ s ++ "\ESC[m"
-                                   _    -> s
+    regLine isTop = br 1 . bl $ intercalate sepDist (replicate (length regs) $ oneReg isTop)
     oneReg isTop = case chs of ASCII -> "+---------+"
-                               _     -> ansiFg Blue $ if isTop then "┎─────────┐" else "┖─────────┘"
-    regsHex = mkRegs $ zipWith (\c r -> ansiFg Green (c : ": ") ++
-      (nChar ' ' (4 + length (bw ""))  $ "0x" ++ bw (showHex r ""))) ['A'..] regs
-    regsU = mkRegs $ map (ansiFg White . ("    " ++) . nChar ' ' 3 . show) regs
-    regsDec = mkRegs $ map (ansiFg White . ("   " ++) . nChar ' ' 4 . sign) regs
-    mkRegs rs = regStart ++ intercalate regSep rs ++ regStop ++ "\n"
-    regStart = case chs of ASCII   -> "| "
-                           _       -> ansiFg Blue "┃ "
-    regSep   = case chs of ASCII   -> " |  | "
-                           _       -> ansiFg Blue " │  ┃ "
-    regStop  = case chs of ASCII   -> " |"
-                           _       -> ansiFg Blue " │"
-    diodes = "  " ++ insertSpace (map applyEnc (nChar '0' 8 $ showIntAtBase 2 ("01" !!) ls "")) ++ yl "   hex: " ++
-      "0x" ++ bw (showHex ls "") ++ yl "   udec: " ++ wt (show ls) ++ yl "    sdec: " ++ wt (sign ls)
+                               _     -> ansiFg Blue $ if isTop then "┏━┯━━━━━━┓" else "┗━━━━━━━━┛"
+    ansiFg = ansiForeground chs
+    ansiAttr = ansiAttribute chs
+    regsHex = br 1 . bl $ mkRegs False $ zipWith (\c r -> ansiFg Green (pure c) ++
+      asciiUni "  " (ansiFg Blue "│ ") ++
+      "0x" ++ bw (nChar '0' 2 $ showHex r "")) ['A'..] regs
+    regsU = br 1 . bl $ mkRegs True $ map (((case chs of ASCII -> "    "; _ -> ansiFg Blue "─┘  ") ++) . wt .
+      nChar ' ' 3 . show) regs
+    regsDec = br 1 . bl $ mkRegs False $ map (ansiFg White . ("   " ++) . nChar ' ' 4 . sign) regs
+    mkRegs isMid rs = regStart isMid ++ intercalate (regSep isMid) rs ++ regStop
+    regStart isMid = case chs of ASCII   -> "| "
+                                 _       -> ansiFg Blue $ if isMid then "┠" else "┃"
+    regStop        = case chs of ASCII   -> " |"
+                                 _       -> ansiFg Blue " ┃"
+    regSep = (regStop ++) . (sepDist ++) . regStart
+    sepDist = case chs of ASCII -> "  "; _ -> " "
+    horThick n = replicate n '━'
+    diodeTopLine = asciiUni "" . br 6 . bl . yl . ("     ┏" ++) . (++ "┓") . intercalate "┯" $ map horThick [11,6,5,6]
+    diodeBotLine = asciiUni "" . br 6 . bl . yl . ("     ┗" ++) . (++ "┛") . intercalate "┷" $ map horThick [11,6,5,6]
+    diodes = diodeTopLine ++ (br 6 . bl) (asciiUni "  " (yl "     ┃ ") ++ insertSpace (map applyEnc (nChar '0' 8 $
+      showIntAtBase 2 ("01" !!) ls "")) ++ asciiUni "   hex: " (yl " │ ") ++
+      "0x" ++ bw (nChar '0' 2 $ showHex ls "") ++ asciiUni "   udec: " (yl " │ ") ++
+      wt (nChar ' ' 3 $ show ls) ++ asciiUni "    sdec: " (yl " │ ") ++ wt (nChar ' ' 4 $ sign ls) ++
+      asciiUni "" (yl " ┃")) ++ diodeBotLine
+    asciiUni sa su = case chs of ASCII -> sa; _ -> su
     bw = ansiAttr Bold . ansiFg White
     yl = ansiFg Yellow
     wt = ansiFg White
+    bl = (asciiUni "" (ansiFg Cyan "│ ") ++)
+    br n = (++ asciiUni "\n" (ansiFg Cyan $ replicate n ' ' ++ "│\n"))
     applyEnc l | l == '0' = case chs of
                  ASCII   -> "O"
                  Unicode -> "○"
@@ -383,7 +412,7 @@ prettyResult chs (Result li regs ls) =
     insertSpace xs = concat xs
     line | isNothing li   = ""
          | otherwise      = case chs of ASCII   -> replicate 50 '_' ++ "\n\n"
-                                        _       -> ansiFg Cyan $ replicate 50 '─' ++ "\n"
+                                        _       -> ansiFg Cyan $ '├' : replicate 45 '─' ++ "┤\n"
 
 sign :: Word8 -> String
 sign (fromIntegral -> x) | x > 127   = show (x - 256)
@@ -399,7 +428,7 @@ runCPU :: Charset -> String -> IO ()
 runCPU chs file = do
   content <- lines <$> readFile file
   either putStrLn (run . catMaybes) $ linesToInss content
-  where run = mapM_ (putStrLn . prettyResult chs) . results
+  where run = putStr . prettyResults chs . results
         results is = newSimResult (cpu is) : evalState simulate (cpu is)
         cpu is = defaultCPU {rightInss = is}
 
