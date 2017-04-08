@@ -1,4 +1,9 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving, ViewPatterns, LambdaCase, MultiWayIf #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE ViewPatterns               #-}
+{-# LANGUAGE LambdaCase                 #-}
+{-# LANGUAGE MultiWayIf                 #-}
+{-# LANGUAGE NamedFieldPuns             #-}
+{-# LANGUAGE RecordWildCards            #-}
 
 module Main where
 
@@ -14,12 +19,13 @@ import Data.Word
 import Numeric
 
 
+-- TODO: maybe change from using leftInss and rightInns to using just an array
+-- (or a list) of Instructions and an instruction pointer
 -- TODO: add support for labels
 -- TODO: add linenumbers to instructions
 -- TODO: add instruction to negate flags
 -- TODO: allow reading a register directly into the ALU, changing the cmp flags
 -- TODO: add datatypes for flags and registers instead of the silly Tuples
--- (maybe rename current Register type to RegisterID)
 
 data AnsiAttribute =
   Off | Bold | Underline | Undefined | Italic | BlinkSlow | BlinkRapid | Reverse | Conceal deriving (Show, Enum)
@@ -51,7 +57,9 @@ type CPURegs = (Word8, Word8, Word8, Word8)
 
 newtype Constant = Constant Word8 deriving (Show, Enum, Real, Num, Ord, Eq, Integral)
 
-data Register = RegA | RegB | RegC | RegD deriving (Show)
+data RegisterID = RegA | RegB | RegC | RegD deriving (Eq, Show)
+
+newtype Registers = Registers {getRegs :: RegisterID -> Word8}
 
 newtype Address = Address Word8 deriving (Show, Enum, Real, Num, Ord, Eq, Integral)
 
@@ -62,15 +70,22 @@ data Alu1Ins = Negate | Not deriving (Show)
 
 data Alu2Ins = Add | ShiftLeft | ShiftRight | And | Or | Xor deriving (Show)
 
-data Instruction = ConstTo Register Constant
-                 | Output Register
+data Instruction = ConstTo RegisterID Constant
+                 | Output RegisterID
                  | Jump Address
                  | JumpIf Flag Address
-                 | CopyFromRegA Register
-                 | Alu1 Alu1Ins Register
-                 | Alu2 Alu2Ins Register
+                 | CopyFromRegA RegisterID
+                 | Alu1 Alu1Ins RegisterID
+                 | Alu2 Alu2Ins RegisterID
                  | Halt
                  deriving (Show)
+
+updateRegs :: RegisterID -> Word8 -> Registers -> Registers
+updateRegs rid n rs@(Registers gr) = let getRegs nid | rid == nid = gr nid
+                                                     | otherwise  = n
+                                     in rs {getRegs}
+
+
 
 stringsToIns :: [String] -> Either String Instruction
 stringsToIns [['c', 't', r], c] | isReg = Right . ConstTo (head reg) =<< readC
@@ -116,7 +131,7 @@ stringsToIns [ins, reg] | isAlu = Right . fromJust alu =<< stringToReg reg
 stringsToIns ["halt"] = Right Halt
 stringsToIns s = Left $ show (unwords s) ++ " is not a valid Instruction"
 
-stringToReg :: String -> Either String Register
+stringToReg :: String -> Either String RegisterID
 stringToReg "a" = Right RegA
 stringToReg "b" = Right RegB
 stringToReg "c" = Right RegC
@@ -129,13 +144,13 @@ linesToInss =
     where emptyLine l | all isSpace l = Nothing
                       | otherwise     = Just l
 
-regToHex :: Register -> String
+regToHex :: RegisterID -> String
 regToHex RegA = "0"
 regToHex RegB = "1"
 regToHex RegC = "2"
 regToHex RegD = "3"
 
-regToInt :: Register -> Int
+regToInt :: RegisterID -> Int
 regToInt RegA = 0
 regToInt RegB = 1
 regToInt RegC = 2
@@ -183,9 +198,6 @@ printHex file = do
   content <- lines <$> readFile file
   mapM_ putStrLn . either pure (map insToHex . catMaybes) $ linesToInss content
 
--- TODO: maybe group two adjacent lines together and separate them with a space
--- instead. Logisim doesn't seem to care about what kind of whitespace
--- separates the bytes, and it will make the text file nicer to look at.
 printLogisim :: String -> IO ()
 printLogisim file = do
   content <- lines <$> readFile file
@@ -200,56 +212,54 @@ printLogisim file = do
 simulate :: State CPUState [Result]
 simulate = gets rightInss >>= \case
     []         -> return []
-    -- (Halt : _) -> return []
     (i : _)   ->
       unsafeIncIns >> eval i >> putLI i >> gets newSimResult >>= (<$> case i of Halt -> return []
                                                                                 _    -> simulate) . (:)
   where
-    unsafeIncIns :: State CPUState ()
     unsafeIncIns = modify' $ \s@(CPUState _ ls (r:rs) _ _ _) -> s {leftInss = r : ls, rightInss = rs}
 
 putLI :: Instruction -> State CPUState ()
 putLI i = modify' $ \s -> s {lastIns = Just i}
 
-putReg :: Register -> Word8 -> State CPUState ()
-putReg r x = modify' $ \s@(CPUState _ _ _ _ (a,b,c,d) _) ->
-  let newRegs = case r of
+putReg :: RegisterID -> Word8 -> State CPUState ()
+putReg r x = modify' $ \s@CPUState {cpuRegs = (a,b,c,d)} ->
+  let cpuRegs = case r of
         RegA -> (x,b,c,d)
         RegB -> (a,x,c,d)
         RegC -> (a,b,x,d)
         RegD -> (a,b,c,x)
-  in s {cpuRegs = newRegs}
+  in s {cpuRegs}
 
 putFlag :: Flag -> Bool -> State CPUState ()
-putFlag f b = modify' $ \s@(CPUState _ _ _ (g,e,l,c) _ _) ->
-  let newFlags = case f of
+putFlag f b = modify' $ \s@CPUState {flags = (g,e,l,c)} ->
+  let flags = case f of
         Greater -> (b,e,l,c)
         Equal   -> (g,b,l,c)
         Less    -> (g,e,b,c)
         Carry   -> (g,e,l,b)
-  in s {flags = newFlags}
+  in s {flags}
 
 putFlags :: Ordering -> State CPUState ()
-putFlags GT = putFlag Greater True  >> putFlag Equal False >> putFlag Less False
-putFlags EQ = putFlag Greater False >> putFlag Equal True  >> putFlag Less False
-putFlags LT = putFlag Greater False >> putFlag Equal False >> putFlag Less True
+putFlags = zipWithM_ putFlag [ Greater, Equal, Less  ] . \case
+  GT ->                      [ True   , False, False ]
+  EQ ->                      [ False  , True , False ]
+  LT ->                      [ False  , False, True  ]
 
 putOutput :: Word8 -> State CPUState ()
--- XXX is there a shorter way to write this?
-putOutput x = modify' $ \s -> s {output = x}
+putOutput output = modify' $ \s -> s {output}
 
 -- we jump backwards one extra step because we increment before that
 jump :: Address -> State CPUState ()
 jump (Address a) = modify' $ \cs@(CPUState _ ls rs _ _ _) ->
   if | a == 0    -> cs {leftInss = drop 1 ls, rightInss = take 1 ls ++ rs}
-     | a > 127   -> let s = - (fromIntegral a - 256 - 1)
-                        (r, l) = splitAt s ls
-                    in cs {leftInss = l, rightInss = reverse r ++ rs}
-     | otherwise -> let s = fromIntegral a - 1
-                        (l, r) = splitAt s rs
-                    in cs {leftInss = ls ++ l, rightInss = r}
+     | a > 127   -> let s             = - (fromIntegral a - 256 - 1)
+                        (r, leftInss) = splitAt s ls
+                    in cs {leftInss, rightInss = reverse r ++ rs}
+     | otherwise -> let s              = fromIntegral a - 1
+                        (l, rightInss) = splitAt s rs
+                    in cs {leftInss = ls ++ l, rightInss}
 
-getReg :: Register -> State CPUState Word8
+getReg :: RegisterID -> State CPUState Word8
 getReg r = gets cpuRegs >>= \(a,b,c,d) -> return $ case r of
   RegA -> a
   RegB -> b
@@ -265,15 +275,15 @@ getFlag f = gets flags >>= \(g,e,l,c) -> return $ case f of
 
 eval :: Instruction -> State CPUState ()
 eval (ConstTo r (Constant x)) = putReg r x
-eval (Output r) = getReg r >>= putOutput
-eval (Jump a) = jump a
-eval (JumpIf f a) = getFlag f >>= \b -> when b $ jump a
-eval (CopyFromRegA r) = getReg RegA >>= putReg r
-eval (Alu1 i r) = evalAlu1 i r
-eval (Alu2 i r) = evalAlu2 i r
+eval (Output r)               = getReg r >>= putOutput
+eval (Jump a)                 = jump a
+eval (JumpIf f a)             = getFlag f >>= \b -> when b $ jump a
+eval (CopyFromRegA r)         = getReg RegA >>= putReg r
+eval (Alu1 i r)               = evalAlu1 i r
+eval (Alu2 i r)               = evalAlu2 i r
 eval Halt = return ()
 
-evalAlu1 :: Alu1Ins -> Register -> State CPUState ()
+evalAlu1 :: Alu1Ins -> RegisterID -> State CPUState ()
 evalAlu1 i r = do
   let f = case i of
             Negate -> negate
@@ -282,7 +292,7 @@ evalAlu1 i r = do
   putReg r x
   putFlags $ compare x 0
 
-evalAlu2 :: Alu2Ins -> Register -> State CPUState ()
+evalAlu2 :: Alu2Ins -> RegisterID -> State CPUState ()
 evalAlu2 i r = do
   a <- getReg RegA
   x <- getReg r
@@ -301,40 +311,40 @@ evalAlu2 i r = do
     _   -> return ()
 
 newSimResult :: CPUState -> Result
-newSimResult (CPUState li _ _ _ (a,b,c,d) out) = Result li [a,b,c,d] out
+newSimResult CPUState {cpuRegs = (a,b,c,d), ..} = Result lastIns [a,b,c,d] output
 
 prettyIns :: Instruction -> String
-prettyIns (ConstTo r c) = "ct" ++ prettyReg r ++ " " ++ prettyConst c
-prettyIns (Output r) = "out " ++ prettyReg r
-prettyIns (Jump a) = "jmp " ++ prettyAddress a
-prettyIns (JumpIf f a) = "j" ++ prettyFlag f ++ " " ++ prettyAddress a
+prettyIns (ConstTo r c)    = "ct" ++ prettyReg r ++ " " ++ prettyConst c
+prettyIns (Output r)       = "out " ++ prettyReg r
+prettyIns (Jump a)         = "jmp " ++ prettyAddress a
+prettyIns (JumpIf f a)     = "j" ++ prettyFlag f ++ " " ++ prettyAddress a
 prettyIns (CopyFromRegA r) = "mov " ++ prettyReg r
-prettyIns (Alu1 i r) = prettyAlu1Ins i ++ " " ++ prettyReg r
-prettyIns (Alu2 i r) = prettyAlu2Ins i ++ " " ++ prettyReg r
-prettyIns Halt = "halt"
+prettyIns (Alu1 i r)       = prettyAlu1Ins i ++ " " ++ prettyReg r
+prettyIns (Alu2 i r)       = prettyAlu2Ins i ++ " " ++ prettyReg r
+prettyIns Halt             = "halt"
 
 prettyAlu1Ins :: Alu1Ins -> String
 prettyAlu1Ins Negate = "neg"
-prettyAlu1Ins Not = "not"
+prettyAlu1Ins Not    = "not"
 
 prettyAlu2Ins :: Alu2Ins -> String
-prettyAlu2Ins Add = "add"
-prettyAlu2Ins ShiftLeft = "shl"
+prettyAlu2Ins Add        = "add"
+prettyAlu2Ins ShiftLeft  = "shl"
 prettyAlu2Ins ShiftRight = "shr"
-prettyAlu2Ins And = "and"
-prettyAlu2Ins Or = "or"
-prettyAlu2Ins Xor = "xor"
+prettyAlu2Ins And        = "and"
+prettyAlu2Ins Or         = "or"
+prettyAlu2Ins Xor        = "xor"
 
 prettyFlag :: Flag -> String
 prettyFlag Greater = "g"
-prettyFlag Equal = "z"
-prettyFlag Less = "l"
-prettyFlag Carry = "c"
+prettyFlag Equal   = "z"
+prettyFlag Less    = "l"
+prettyFlag Carry   = "c"
 
 prettyAddress :: Address -> String
 prettyAddress (Address a) = sign a
 
-prettyReg :: Register -> String
+prettyReg :: RegisterID -> String
 prettyReg RegA = "a"
 prettyReg RegB = "b"
 prettyReg RegC = "c"
@@ -346,8 +356,8 @@ prettyConst (Constant c) = "0x" ++ nChar '0' 2 (showHex c " ; u: ") ++ show c ++
 prettyResults :: Charset -> [Result] -> String
 prettyResults chs = tblines . concatMap (prettyResult chs)
   where tblines s = topLine ++ s ++ botLine
-        topLine = ansiForeground chs Cyan $ "┌" ++ replicate 45 '─' ++ "┐\n"
-        botLine = ansiForeground chs Cyan $ "└" ++ replicate 45 '─' ++ "┘"
+        topLine = ansiForeground chs Cyan $ "┏" ++ replicate 45 '━' ++ "┓\n"
+        botLine = ansiForeground chs Cyan $ "┗" ++ replicate 45 '━' ++ "┛"
 
 ansiAttribute :: Charset -> AnsiAttribute -> String -> String
 ansiAttribute chs attr = ansiNumber chs $ fromEnum attr
@@ -399,8 +409,8 @@ prettyResult chs (Result li regs ls) =
     bw = ansiAttr Bold . ansiFg White
     yl = ansiFg Yellow
     wt = ansiFg White
-    bl = (asciiUni "" (ansiFg Cyan "│ ") ++)
-    br n = (++ asciiUni "\n" (ansiFg Cyan $ replicate n ' ' ++ "│\n"))
+    bl = (asciiUni "" (ansiFg Cyan "┃ ") ++)
+    br n = (++ asciiUni "\n" (ansiFg Cyan $ replicate n ' ' ++ "┃\n"))
     applyEnc l | l == '0' = case chs of
                  ASCII   -> "O"
                  Unicode -> "○"
@@ -412,7 +422,7 @@ prettyResult chs (Result li regs ls) =
     insertSpace xs = concat xs
     line | isNothing li   = ""
          | otherwise      = case chs of ASCII   -> replicate 50 '_' ++ "\n\n"
-                                        _       -> ansiFg Cyan $ '├' : replicate 45 '─' ++ "┤\n"
+                                        _       -> ansiFg Cyan $ '┠' : replicate 45 '─' ++ "┨\n"
 
 sign :: Word8 -> String
 sign (fromIntegral -> x) | x > 127   = show (x - 256)
