@@ -4,6 +4,7 @@
 {-# LANGUAGE MultiWayIf                 #-}
 {-# LANGUAGE NamedFieldPuns             #-}
 {-# LANGUAGE RecordWildCards            #-}
+{-# LANGUAGE TupleSections              #-}
 
 module Main where
 
@@ -17,15 +18,20 @@ import Data.Either
 import System.Environment
 import Data.Word
 import Numeric
+import qualified Data.Map.Strict as M
 
 
+-- TODO: print out in binary
 -- TODO: maybe change from using leftInss and rightInns to using just an array
 -- (or a list) of Instructions and an instruction pointer
 -- TODO: add support for labels
 -- TODO: add linenumbers to instructions
 -- TODO: add instruction to negate flags
--- TODO: allow reading a register directly into the ALU, changing the cmp flags
--- TODO: add datatypes for flags and registers instead of the silly Tuples
+-- maybe also just remove Greater and Less, and just allow jumps depending on
+-- Equal or Not equal (and carry)
+-- TODO: allow reading a register directly into the ALU, changing the cmp
+-- flags.
+-- TODO: add a second carry flag for unsigned operation
 
 data AnsiAttribute =
   Off | Bold | Underline | Undefined | Italic | BlinkSlow | BlinkRapid | Reverse | Conceal deriving (Show, Enum)
@@ -38,13 +44,14 @@ data Charset = ASCII | Unicode | ANSI
 data CPUState = CPUState { lastIns   :: Maybe Instruction
                          , leftInss  :: [Instruction]
                          , rightInss :: [Instruction]
-                         , flags     :: (Bool, Bool, Bool, Bool)
-                         , cpuRegs   :: (Word8, Word8, Word8, Word8)
+                         , flags     :: M.Map FlagID Bool
+                         , cpuRegs   :: M.Map RegisterID Word8
                          , output    :: Word8
                          } deriving (Show)
 
+
 data Result = Result { resultIns  :: Maybe Instruction
-                     , resultRegs :: [Word8]
+                     , resultRegs :: M.Map RegisterID Word8
                      , leds       :: Word8
                      } deriving (Show)
 
@@ -53,18 +60,15 @@ data Option = Option { switch :: Char
                      , action :: String -> IO ()
                      }
 
+data FlagID = Greater | Equal | Less | Carry deriving (Enum, Eq, Ord, Show)
+
 type CPURegs = (Word8, Word8, Word8, Word8)
 
 newtype Constant = Constant Word8 deriving (Show, Enum, Real, Num, Ord, Eq, Integral)
 
-data RegisterID = RegA | RegB | RegC | RegD deriving (Eq, Show)
-
-newtype Registers = Registers {getRegs :: RegisterID -> Word8}
+data RegisterID = RegA | RegB | RegC | RegD deriving (Enum, Eq, Ord, Show)
 
 newtype Address = Address Word8 deriving (Show, Enum, Real, Num, Ord, Eq, Integral)
-
-data Flag = Greater | Equal | Less | Carry
-          deriving (Show)
 
 data Alu1Ins = Negate | Not deriving (Show)
 
@@ -73,19 +77,12 @@ data Alu2Ins = Add | ShiftLeft | ShiftRight | And | Or | Xor deriving (Show)
 data Instruction = ConstTo RegisterID Constant
                  | Output RegisterID
                  | Jump Address
-                 | JumpIf Flag Address
+                 | JumpIf FlagID Address
                  | CopyFromRegA RegisterID
                  | Alu1 Alu1Ins RegisterID
                  | Alu2 Alu2Ins RegisterID
                  | Halt
                  deriving (Show)
-
-updateRegs :: RegisterID -> Word8 -> Registers -> Registers
-updateRegs rid n rs@(Registers gr) = let getRegs nid | rid == nid = gr nid
-                                                     | otherwise  = n
-                                     in rs {getRegs}
-
-
 
 stringsToIns :: [String] -> Either String Instruction
 stringsToIns [['c', 't', r], c] | isReg = Right . ConstTo (head reg) =<< readC
@@ -178,7 +175,7 @@ alu2InsToHex And        = "3"
 alu2InsToHex Or         = "4"
 alu2InsToHex Xor        = "5"
 
-flagToHex :: Flag -> String
+flagToHex :: FlagID -> String
 flagToHex Greater = "2"
 flagToHex Equal   = "1"
 flagToHex Less    = "3"
@@ -201,12 +198,7 @@ printHex file = do
 printLogisim :: String -> IO ()
 printLogisim file = do
   content <- lines <$> readFile file
-  -- TODO actually pairs is wrong because we have 16 data bits in our ROM, not
-  -- 8
-  let pairs :: [String] -> [String]
-      pairs ([a,b,c,d] : rest) = [a,b] : [c,d] : pairs rest
-      pairs _ = []
-  putStrLn . ("v2.0 raw\n" ++) . unlines . pairs . either pure (map insToHex . catMaybes) $
+  putStrLn . ("v2.0 raw\n" ++) . unlines . either pure (map insToHex . catMaybes) $
     linesToInss content
 
 simulate :: State CPUState [Result]
@@ -222,22 +214,10 @@ putLI :: Instruction -> State CPUState ()
 putLI i = modify' $ \s -> s {lastIns = Just i}
 
 putReg :: RegisterID -> Word8 -> State CPUState ()
-putReg r x = modify' $ \s@CPUState {cpuRegs = (a,b,c,d)} ->
-  let cpuRegs = case r of
-        RegA -> (x,b,c,d)
-        RegB -> (a,x,c,d)
-        RegC -> (a,b,x,d)
-        RegD -> (a,b,c,x)
-  in s {cpuRegs}
+putReg r x = modify' $ \s@CPUState {..} -> s {cpuRegs = M.insert r x cpuRegs}
 
-putFlag :: Flag -> Bool -> State CPUState ()
-putFlag f b = modify' $ \s@CPUState {flags = (g,e,l,c)} ->
-  let flags = case f of
-        Greater -> (b,e,l,c)
-        Equal   -> (g,b,l,c)
-        Less    -> (g,e,b,c)
-        Carry   -> (g,e,l,b)
-  in s {flags}
+putFlag :: FlagID -> Bool -> State CPUState ()
+putFlag f b = modify' $ \s@CPUState {..} -> s {flags = M.insert f b flags}
 
 putFlags :: Ordering -> State CPUState ()
 putFlags = zipWithM_ putFlag [ Greater, Equal, Less  ] . \case
@@ -259,19 +239,18 @@ jump (Address a) = modify' $ \cs@(CPUState _ ls rs _ _ _) ->
                         (l, rightInss) = splitAt s rs
                     in cs {leftInss = ls ++ l, rightInss}
 
-getReg :: RegisterID -> State CPUState Word8
-getReg r = gets cpuRegs >>= \(a,b,c,d) -> return $ case r of
-  RegA -> a
-  RegB -> b
-  RegC -> c
-  RegD -> d
+-- getReg :: RegisterID -> State CPUState Word8
+-- getReg r = gets cpuRegs >>= \(a,b,c,d) -> return $ case r of
+--   RegA -> a
+--   RegB -> b
+--   RegC -> c
+--   RegD -> d
 
-getFlag :: Flag -> State CPUState Bool
-getFlag f = gets flags >>= \(g,e,l,c) -> return $ case f of
-  Greater -> g
-  Equal   -> e
-  Less    -> l
-  Carry   -> c
+getReg :: RegisterID -> State CPUState Word8
+getReg r = gets ((M.! r) . cpuRegs)
+
+getFlag :: FlagID -> State CPUState Bool
+getFlag f = gets ((M.! f) . flags)
 
 eval :: Instruction -> State CPUState ()
 eval (ConstTo r (Constant x)) = putReg r x
@@ -311,13 +290,13 @@ evalAlu2 i r = do
     _   -> return ()
 
 newSimResult :: CPUState -> Result
-newSimResult CPUState {cpuRegs = (a,b,c,d), ..} = Result lastIns [a,b,c,d] output
+newSimResult CPUState {..} = Result lastIns cpuRegs output
 
 prettyIns :: Instruction -> String
 prettyIns (ConstTo r c)    = "ct" ++ prettyReg r ++ " " ++ prettyConst c
 prettyIns (Output r)       = "out " ++ prettyReg r
 prettyIns (Jump a)         = "jmp " ++ prettyAddress a
-prettyIns (JumpIf f a)     = "j" ++ prettyFlag f ++ " " ++ prettyAddress a
+prettyIns (JumpIf f a)     = "j" ++ prettyFlagID f ++ " " ++ prettyAddress a
 prettyIns (CopyFromRegA r) = "mov " ++ prettyReg r
 prettyIns (Alu1 i r)       = prettyAlu1Ins i ++ " " ++ prettyReg r
 prettyIns (Alu2 i r)       = prettyAlu2Ins i ++ " " ++ prettyReg r
@@ -335,11 +314,11 @@ prettyAlu2Ins And        = "and"
 prettyAlu2Ins Or         = "or"
 prettyAlu2Ins Xor        = "xor"
 
-prettyFlag :: Flag -> String
-prettyFlag Greater = "g"
-prettyFlag Equal   = "z"
-prettyFlag Less    = "l"
-prettyFlag Carry   = "c"
+prettyFlagID :: FlagID -> String
+prettyFlagID Greater = "g"
+prettyFlagID Equal   = "z"
+prettyFlagID Less    = "l"
+prettyFlagID Carry   = "c"
 
 prettyAddress :: Address -> String
 prettyAddress (Address a) = sign a
@@ -373,13 +352,13 @@ ansiCustom chs fmt s = case chs of ANSI -> "\ESC[" ++ fmt ++ "m" ++ s ++ "\ESC[m
                                    _    -> s
 
 prettyResult :: Charset -> Result -> String
-prettyResult chs (Result li regs ls) =
+prettyResult chs (Result li (M.elems -> regs) ls) =
   line ++ lastI ++ regLine True ++ regsHex ++ regsU ++ regsDec ++ regLine False ++ diodes
   where
     lastI = br (44 - length lastI' + if isJust li then length (ansiAttr Bold $ ansiFg White "") else 0) $ bl lastI'
     lastI' = maybe "Initial State:" (\i -> "Instruction: " ++ instruction i) li
     instruction = ansiFg Red . ansiAttr Bold . prettyIns
-    regLine isTop = br 1 . bl $ intercalate sepDist (replicate (length regs) $ oneReg isTop)
+    regLine isTop = br 1 . bl $ intercalate sepDist (replicate 4 $ oneReg isTop)
     oneReg isTop = case chs of ASCII -> "+---------+"
                                _     -> ansiFg Blue $ if isTop then "┏━┯━━━━━━┓" else "┗━━━━━━━━┛"
     ansiFg = ansiForeground chs
@@ -432,7 +411,7 @@ nChar :: Char -> Int -> String -> String
 nChar c n s = replicate (n - length s) c ++ s
 
 defaultCPU :: CPUState
-defaultCPU = CPUState Nothing [] [] (False, False, False, False) (0, 0, 0, 0) 0
+defaultCPU = CPUState Nothing [] [] (M.fromList $ map (,False) [Greater ..]) (M.fromList $ map (,0) [RegA ..]) 0
 
 runCPU :: Charset -> String -> IO ()
 runCPU chs file = do
@@ -459,10 +438,10 @@ usage progName = "Usage: " ++ progName ++ " -(" ++ switches ++ ") FILE\n" ++ opt
       unlines $ zipWith ((++) . ("  -" ++) . (:": ")) (map switch options) (map desc options)
 
 options :: [Option]
-options = [ Option 'p' "print both hexadecimal and the original assembly"   printHexAndOrig
-          , Option 'h' "print only hexadecimal"                             printHex
-          , Option 'l' "print in Logisim ROM format"                        printLogisim
-          , Option 'r' "simulate the CPU (ASCII output)"                  $ runCPU ASCII
-          , Option 'u' "simulate the CPU (Unicode output)"                $ runCPU Unicode
-          , Option 'a' "simulate the CPU (ANSI output)"                   $ runCPU ANSI
+options = [ Option 'p' "print both hexadecimal and the original assembly"                printHexAndOrig
+          , Option 'h' "print only hexadecimal"                                          printHex
+          , Option 'l' "print in Logisim ROM format"                                     printLogisim
+          , Option 'r' "simulate the CPU (ASCII output)"                               $ runCPU ASCII
+          , Option 'u' "simulate the CPU (Unicode output)"                             $ runCPU Unicode
+          , Option 'a' "simulate the CPU (Unicode output using ANSI Escape Sequences)" $ runCPU ANSI
           ]
