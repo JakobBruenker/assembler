@@ -16,7 +16,10 @@ import Numeric
 
 -- TODO: add support for labels
 -- TODO: add linenumbers to instructions
+-- TODO: add instruction to negate flags
 -- TODO: allow reading a register directly into the ALU, changing the cmp flags
+-- TODO: add datatypes for flags and registers instead of the silly Tuples
+-- (maybe rename current Register type to RegisterID)
 
 data AnsiAttribute =
   Off | Bold | Underline | Undefined | Italic | BlinkSlow | BlinkRapid | Reverse | Conceal deriving (Show, Enum)
@@ -24,7 +27,7 @@ data AnsiAttribute =
 data AnsiColor =
   Black | Red | Green | Yellow | Blue | Magenta | Cyan | White deriving (Show, Enum)
 
-data Encoding = ASCII | Unicode | ANSI
+data Charset = ASCII | Unicode | ANSI
 
 data CPUState = CPUState { lastIns   :: Maybe Instruction
                          , leftInss  :: [Instruction]
@@ -52,7 +55,7 @@ data Register = RegA | RegB | RegC | RegD deriving (Show)
 
 newtype Address = Address Word8 deriving (Show, Enum, Real, Num, Ord, Eq, Integral)
 
-data Flag = Greater | Equal | Less | Carry | OrFlag Flag Flag | NotFlag Flag
+data Flag = Greater | Equal | Less | Carry
           deriving (Show)
 
 data Alu1Ins = Negate | Not deriving (Show)
@@ -165,10 +168,6 @@ flagToHex Greater = "2"
 flagToHex Equal   = "1"
 flagToHex Less    = "3"
 flagToHex Carry   = "8"
-flagToHex (OrFlag _ _) = error
-  "jumps that depend on more than one flag are currently not available"
-flagToHex (NotFlag _) = error
-  "jumps that negate flags are currently not available"
 
 appendOriginal :: [String] -> [Maybe Instruction] -> [String]
 appendOriginal ls ms = zipWith ((++) . (++ "    ") . fromMaybe "    ") hexs ls
@@ -267,7 +266,7 @@ eval :: Instruction -> State CPUState ()
 eval (ConstTo r (Constant x)) = putReg r x
 eval (Output r) = getReg r >>= putOutput
 eval (Jump a) = jump a
-eval (JumpIf f a) = evalFlag f >>= \b -> when b $ jump a
+eval (JumpIf f a) = getFlag f >>= \b -> when b $ jump a
 eval (CopyFromRegA r) = getReg RegA >>= putReg r
 eval (Alu1 i r) = evalAlu1 i r
 eval (Alu2 i r) = evalAlu2 i r
@@ -297,12 +296,8 @@ evalAlu2 i r = do
   putReg RegA res
   putFlags $ compare res 0
   case i of
-    Add -> putFlag Carry (let sum = fromIntegral a + fromIntegral x in sum > 127 || sum < 128)
-
-evalFlag :: Flag -> State CPUState Bool
-evalFlag (OrFlag f g) = evalFlag f >>= \fb -> evalFlag g >>= \gb -> return $ fb || gb
-evalFlag (NotFlag f) = not <$> evalFlag f
-evalFlag f = getFlag f
+    Add -> putFlag Carry (let s = fromIntegral a + fromIntegral x in s > 127 || s < 128)
+    _   -> return ()
 
 newSimResult :: CPUState -> Result
 newSimResult (CPUState li _ _ _ (a,b,c,d) out) = Result li [a,b,c,d] out
@@ -334,8 +329,6 @@ prettyFlag Greater = "g"
 prettyFlag Equal = "z"
 prettyFlag Less = "l"
 prettyFlag Carry = "c"
-prettyFlag (NotFlag f) = "n" ++ prettyFlag f
-prettyFlag (OrFlag f g) = prettyFlag f ++ prettyFlag g
 
 prettyAddress :: Address -> String
 prettyAddress (Address a) = sign a
@@ -349,52 +342,47 @@ prettyReg RegD = "d"
 prettyConst :: Constant -> String
 prettyConst (Constant c) = "0x" ++ nChar '0' 2 (showHex c " ; u: ") ++ show c ++ " ; s: " ++ sign c
 
-prettyResult :: Encoding -> Result -> String
-prettyResult enc (Result li regs ls) =
+prettyResult :: Charset -> Result -> String
+prettyResult chs (Result li regs ls) =
   line ++ lastI ++ regLine True ++ regsHex ++ regsU ++ regsDec ++ regLine False ++ diodes
   where
     lastI = maybe "Initial State:\n" (\i -> "Current Instruction: " ++ instruction i ++ "\n") li
     instruction = ansiFg Red . ansiAttr Bold . prettyIns
-    regLine isTop = intercalate "  " (replicate (length regs) $ if isTop then topReg else botReg) ++ "\n"
+    regLine isTop = intercalate "  " (replicate (length regs) $ oneReg isTop) ++ "\n"
     ansiAttr attr = ansiNum $ fromEnum attr
     ansiFg col = ansiNum (30 +  fromEnum col)
-    ansiBg col = ansiNum (40 + fromEnum col)
     ansiNum = ansiCustom . show
-    ansiCustom fmt s = case enc of ANSI -> "\ESC[" ++ fmt ++ "m" ++ s ++ "\ESC[m"
+    ansiCustom fmt s = case chs of ANSI -> "\ESC[" ++ fmt ++ "m" ++ s ++ "\ESC[m"
                                    _    -> s
-    topReg = case enc of ASCII -> "+---------+"
-                         _     -> ansiFg Blue "┎─────────┐"
-    botReg = case enc of ASCII -> "+---------+"
-                         _     -> ansiFg Blue "┖─────────┘"
+    oneReg isTop = case chs of ASCII -> "+---------+"
+                               _     -> ansiFg Blue $ if isTop then "┎─────────┐" else "┖─────────┘"
     regsHex = mkRegs $ zipWith (\c r -> ansiFg Green (c : ": ") ++
-      ansiAttr Bold (ansiFg White (nChar ' ' 4 ("0x" ++ showHex r "")))) ['A'..] regs
+      (nChar ' ' (4 + length (bw ""))  $ "0x" ++ bw (showHex r ""))) ['A'..] regs
     regsU = mkRegs $ map (ansiFg White . ("    " ++) . nChar ' ' 3 . show) regs
     regsDec = mkRegs $ map (ansiFg White . ("   " ++) . nChar ' ' 4 . sign) regs
     mkRegs rs = regStart ++ intercalate regSep rs ++ regStop ++ "\n"
-    regStart = case enc of ASCII   -> "| "
+    regStart = case chs of ASCII   -> "| "
                            _       -> ansiFg Blue "┃ "
-    regSep   = case enc of ASCII   -> " |  | "
+    regSep   = case chs of ASCII   -> " |  | "
                            _       -> ansiFg Blue " │  ┃ "
-    regStop  = case enc of ASCII   -> " |"
+    regStop  = case chs of ASCII   -> " |"
                            _       -> ansiFg Blue " │"
-    diodes = "    " ++ insertSpace (map applyEnc (nChar '0' 8 $ showIntAtBase 2 ("01" !!) ls "")) ++
-      yl "    hex: " ++ bw ("0x" ++ showHex ls "") ++ yl "   udec: " ++ wt (show ls) ++ yl "    sdec: " ++ wt (sign ls)
+    diodes = "  " ++ insertSpace (map applyEnc (nChar '0' 8 $ showIntAtBase 2 ("01" !!) ls "")) ++ yl "   hex: " ++
+      "0x" ++ bw (showHex ls "") ++ yl "   udec: " ++ wt (show ls) ++ yl "    sdec: " ++ wt (sign ls)
     bw = ansiAttr Bold . ansiFg White
     yl = ansiFg Yellow
     wt = ansiFg White
-    diodeDigits = case enc of ASCII   -> "O0"
-                              _       -> "○●"
-    applyEnc l | l == '0' = case enc of
+    applyEnc l | l == '0' = case chs of
                  ASCII   -> "O"
                  Unicode -> "○"
                  ANSI    -> ansiFg Black "●"
-               | otherwise = case enc of
-                 ASCII   -> "0"
-                 Unicode -> "●"
-                 ANSI    -> ansiFg Red "●"
+               | otherwise = case chs of
+                 ASCII -> "0"
+                 _     -> ansiFg Red "●"
     insertSpace (a:b:c:d:r) = concat $ a:b:c:d:" ":r
+    insertSpace xs = concat xs
     line | isNothing li   = ""
-         | otherwise      = case enc of ASCII   -> replicate 50 '_' ++ "\n\n"
+         | otherwise      = case chs of ASCII   -> replicate 50 '_' ++ "\n\n"
                                         _       -> ansiFg Cyan $ replicate 50 '─' ++ "\n"
 
 sign :: Word8 -> String
@@ -407,11 +395,11 @@ nChar c n s = replicate (n - length s) c ++ s
 defaultCPU :: CPUState
 defaultCPU = CPUState Nothing [] [] (False, False, False, False) (0, 0, 0, 0) 0
 
-runCPU :: Encoding -> String -> IO ()
-runCPU enc file = do
+runCPU :: Charset -> String -> IO ()
+runCPU chs file = do
   content <- lines <$> readFile file
   either putStrLn (run . catMaybes) $ linesToInss content
-  where run = mapM_ (putStrLn . prettyResult enc) . results
+  where run = mapM_ (putStrLn . prettyResult chs) . results
         results is = newSimResult (cpu is) : evalState simulate (cpu is)
         cpu is = defaultCPU {rightInss = is}
 
