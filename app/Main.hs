@@ -31,7 +31,9 @@ import qualified Data.Map.Strict as M
 -- Equal or Not equal (and carry)
 -- TODO: allow reading a register directly into the ALU, changing the cmp
 -- flags.
--- TODO: add a second carry flag for unsigned operation
+-- TODO: add a second carry flag for signed operation actually - technically
+-- don't need signed one because you can get it from anding with 1000 0000, or
+-- something
 
 data AnsiAttribute =
   Off | Bold | Underline | Undefined | Italic | BlinkSlow | BlinkRapid | Reverse | Conceal deriving (Show, Enum)
@@ -47,12 +49,14 @@ data CPUState = CPUState { lastIns   :: Maybe Instruction
                          , flags     :: M.Map FlagID Bool
                          , cpuRegs   :: M.Map RegisterID Word8
                          , output    :: Word8
+                         , cpuSteps  :: Integer
                          } deriving (Show)
 
 
-data Result = Result { resultIns  :: Maybe Instruction
-                     , resultRegs :: M.Map RegisterID Word8
-                     , leds       :: Word8
+data Result = Result { resultIns   :: Maybe Instruction
+                     , resultRegs  :: M.Map RegisterID Word8
+                     , leds        :: Word8
+                     , resultSteps :: Integer
                      } deriving (Show)
 
 data Option = Option { switch :: Char
@@ -207,8 +211,8 @@ simulate = gets rightInss >>= \case
     (i : _)   ->
       unsafeIncIns >> eval i >> putLI i >> gets newSimResult >>= (<$> case i of Halt -> return []
                                                                                 _    -> simulate) . (:)
-  where
-    unsafeIncIns = modify' $ \s@(CPUState _ ls (r:rs) _ _ _) -> s {leftInss = r : ls, rightInss = rs}
+  where unsafeIncIns = modify' $
+          \s@(CPUState _ ls (r:rs) _ _ _ st) -> s {leftInss = r : ls, rightInss = rs, cpuSteps = st + 1}
 
 putLI :: Instruction -> State CPUState ()
 putLI i = modify' $ \s -> s {lastIns = Just i}
@@ -230,7 +234,7 @@ putOutput output = modify' $ \s -> s {output}
 
 -- we jump backwards one extra step because we increment before that
 jump :: Address -> State CPUState ()
-jump (Address a) = modify' $ \cs@(CPUState _ ls rs _ _ _) ->
+jump (Address a) = modify' $ \cs@(CPUState _ ls rs _ _ _ _) ->
   if | a == 0    -> cs {leftInss = drop 1 ls, rightInss = take 1 ls ++ rs}
      | a > 127   -> let s             = - (fromIntegral a - 256 - 1)
                         (r, leftInss) = splitAt s ls
@@ -238,13 +242,6 @@ jump (Address a) = modify' $ \cs@(CPUState _ ls rs _ _ _) ->
      | otherwise -> let s              = fromIntegral a - 1
                         (l, rightInss) = splitAt s rs
                     in cs {leftInss = ls ++ l, rightInss}
-
--- getReg :: RegisterID -> State CPUState Word8
--- getReg r = gets cpuRegs >>= \(a,b,c,d) -> return $ case r of
---   RegA -> a
---   RegB -> b
---   RegC -> c
---   RegD -> d
 
 getReg :: RegisterID -> State CPUState Word8
 getReg r = gets ((M.! r) . cpuRegs)
@@ -286,11 +283,11 @@ evalAlu2 i r = do
   putReg RegA res
   putFlags $ compare res 0
   case i of
-    Add -> putFlag Carry (let s = fromIntegral a + fromIntegral x in s > 127 || s < 128)
+    Add -> putFlag Carry $ fromIntegral a + fromIntegral x > 255
     _   -> return ()
 
 newSimResult :: CPUState -> Result
-newSimResult CPUState {..} = Result lastIns cpuRegs output
+newSimResult CPUState {..} = Result lastIns cpuRegs output cpuSteps
 
 prettyIns :: Instruction -> String
 prettyIns (ConstTo r c)    = "ct" ++ prettyReg r ++ " " ++ prettyConst c
@@ -330,13 +327,15 @@ prettyReg RegC = "c"
 prettyReg RegD = "d"
 
 prettyConst :: Constant -> String
-prettyConst (Constant c) = "0x" ++ nChar '0' 2 (showHex c " ; u: ") ++ show c ++ " ; s: " ++ sign c
+prettyConst (Constant c) = "0x" ++ nChar '0' 2 (showHex c " ; ") ++ show c ++ " ; " ++ sign c
 
 prettyResults :: Charset -> [Result] -> String
 prettyResults chs = tblines . concatMap (prettyResult chs)
   where tblines s = topLine ++ s ++ botLine
-        topLine = ansiForeground chs Cyan $ "┏" ++ replicate 45 '━' ++ "┓\n"
-        botLine = ansiForeground chs Cyan $ "┗" ++ replicate 45 '━' ++ "┛"
+        topLine = case chs of ASCII -> ""
+                              _     -> ansiForeground chs Cyan $ "┏" ++ replicate 45 '━' ++ "┓\n"
+        botLine = case chs of ASCII -> ""
+                              _     -> ansiForeground chs Cyan $ "┗" ++ replicate 45 '━' ++ "┛"
 
 ansiAttribute :: Charset -> AnsiAttribute -> String -> String
 ansiAttribute chs attr = ansiNumber chs $ fromEnum attr
@@ -352,12 +351,15 @@ ansiCustom chs fmt s = case chs of ANSI -> "\ESC[" ++ fmt ++ "m" ++ s ++ "\ESC[m
                                    _    -> s
 
 prettyResult :: Charset -> Result -> String
-prettyResult chs (Result li (M.elems -> regs) ls) =
-  line ++ lastI ++ regLine True ++ regsHex ++ regsU ++ regsDec ++ regLine False ++ diodes
+prettyResult chs (Result li (M.elems -> regs) ls steps) =
+  line False ++ lastI ++ line True ++ regLine True ++ regsHex ++ regsU ++ regsDec ++ regLine False ++ diodes
   where
-    lastI = br (44 - length lastI' + if isJust li then length (ansiAttr Bold $ ansiFg White "") else 0) $ bl lastI'
-    lastI' = maybe "Initial State:" (\i -> "Instruction: " ++ instruction i) li
+    lastI = br 1 . bl $ lastI' ++ spaces dispSteps
+    -- using nChar here makes this really confusing tbh
+    spaces = nChar ' ' (43 - length lastI' + (if isJust li then 2 else 1) * length (bw ""))
+    lastI' = maybe "" instruction li
     instruction = ansiFg Red . ansiAttr Bold . prettyIns
+    dispSteps = ansiFg Magenta . ansiAttr Bold $ show steps
     regLine isTop = br 1 . bl $ intercalate sepDist (replicate 4 $ oneReg isTop)
     oneReg isTop = case chs of ASCII -> "+---------+"
                                _     -> ansiFg Blue $ if isTop then "┏━┯━━━━━━┓" else "┗━━━━━━━━┛"
@@ -399,9 +401,9 @@ prettyResult chs (Result li (M.elems -> regs) ls) =
                  _     -> ansiFg Red "●"
     insertSpace (a:b:c:d:r) = concat $ a:b:c:d:" ":r
     insertSpace xs = concat xs
-    line | isNothing li   = ""
-         | otherwise      = case chs of ASCII   -> replicate 50 '_' ++ "\n\n"
-                                        _       -> ansiFg Cyan $ '┠' : replicate 45 '─' ++ "┨\n"
+    line force | isNothing li, not force  = ""
+               | otherwise                = case chs of ASCII   -> replicate 50 '_' ++ "\n\n"
+                                                        _       -> ansiFg Cyan $ '┠' : replicate 45 '─' ++ "┨\n"
 
 sign :: Word8 -> String
 sign (fromIntegral -> x) | x > 127   = show (x - 256)
@@ -411,7 +413,7 @@ nChar :: Char -> Int -> String -> String
 nChar c n s = replicate (n - length s) c ++ s
 
 defaultCPU :: CPUState
-defaultCPU = CPUState Nothing [] [] (M.fromList $ map (,False) [Greater ..]) (M.fromList $ map (,0) [RegA ..]) 0
+defaultCPU = CPUState Nothing [] [] (M.fromList $ map (,False) [Greater ..]) (M.fromList $ map (,0) [RegA ..]) 0 0
 
 runCPU :: Charset -> String -> IO ()
 runCPU chs file = do
