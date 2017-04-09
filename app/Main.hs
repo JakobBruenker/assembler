@@ -13,16 +13,18 @@ import Control.Monad.State
 import Data.Bits
 import Data.Maybe
 import Data.Char
-import Data.List
+import Data.List hiding (insert)
 import Data.Either
 import System.Environment
 import Data.Word
 import Numeric
-import qualified Data.Map.Strict as M
+import Data.Map.Strict hiding (map, lookup, null)
 
 
+-- TODO: divide into several modules
+-- TODO: allow to run only up to a certain number of steps
 -- TODO: print out in binary
--- TODO: maybe change from using leftInss and rightInns to using just an array
+-- TODO: maybe change from using leftInss and rightInss to using just an array
 -- (or a list) of Instructions and an instruction pointer
 -- TODO: add support for labels
 -- TODO: add linenumbers to instructions
@@ -43,18 +45,18 @@ data AnsiColor =
 
 data Charset = ASCII | Unicode | ANSI
 
-data CPUState = CPUState { lastIns   :: Maybe Instruction
-                         , leftInss  :: [Instruction]
-                         , rightInss :: [Instruction]
-                         , flags     :: M.Map FlagID Bool
-                         , cpuRegs   :: M.Map RegisterID Word8
-                         , output    :: Word8
-                         , cpuSteps  :: Integer
-                         } deriving (Show)
+data CPU = CPU { lastIns   :: Maybe Instruction
+               , leftInss  :: [Instruction]
+               , rightInss :: [Instruction]
+               , flags     :: Map FlagID Bool
+               , cpuRegs   :: Map RegisterID Word8
+               , output    :: Word8
+               , cpuSteps  :: Integer
+               } deriving (Show)
 
 
 data Result = Result { resultIns   :: Maybe Instruction
-                     , resultRegs  :: M.Map RegisterID Word8
+                     , resultRegs  :: Map RegisterID Word8
                      , leds        :: Word8
                      , resultSteps :: Integer
                      } deriving (Show)
@@ -99,25 +101,23 @@ stringsToIns [['c', 't', r], c] | isReg = Right . ConstTo (head reg) =<< readC
                       " is outside the valid constant range of -128..255"
           _ -> Left $ show c ++ " is not a valid constant"
 stringsToIns ["out", reg] = Right . Output =<< stringToReg reg
-stringsToIns ['j' : cs, a] | isJump = Right . fromJust jmp =<< readA
-  where isJump = isJust jmp
+stringsToIns ['j' : cs, a] | Just j <- jmp = Right . j =<< readA
+  where jmp | cs == "mp" = Just Jump
+            | otherwise  = lookup cs jumpIfs
         jumpIfs = [ ("e", JumpIf Equal)
                   , ("z", JumpIf Equal)
                   , ("g", JumpIf Greater)
                   , ("l", JumpIf Less)
                   , ("c", JumpIf Carry)
                   ]
-        jmp | cs == "mp" = Just Jump
-            | otherwise  = lookup cs jumpIfs
         readA = case reads a of
                      [(x, "")] | x < 128 && x >= -128 -> Right $ Address (fromIntegral x)
                                | otherwise            -> Left $ a ++
                                " is outside the valid address range of -128..127"
                      _ -> Left $ show a ++ " is not a valid address"
 stringsToIns [ins, reg] | ins `elem` ["mov", "cpy"] = Right . CopyFromRegA =<< stringToReg reg
-stringsToIns [ins, reg] | isAlu = Right . fromJust alu =<< stringToReg reg
-  where isAlu = isJust alu
-        alu1s = [ ("neg", Negate)
+stringsToIns [ins, reg] | Just i <- alu = Right . i =<< stringToReg reg
+  where alu1s = [ ("neg", Negate)
                 , ("not", Not)
                 ]
         alu2s = [ ("add", Add)
@@ -205,36 +205,36 @@ printLogisim file = do
   putStrLn . ("v2.0 raw\n" ++) . unlines . either pure (map insToHex . catMaybes) $
     linesToInss content
 
-simulate :: State CPUState [Result]
+simulate :: State CPU [Result]
 simulate = gets rightInss >>= \case
     []         -> return []
     (i : _)   ->
       unsafeIncIns >> eval i >> putLI i >> gets newSimResult >>= (<$> case i of Halt -> return []
                                                                                 _    -> simulate) . (:)
   where unsafeIncIns = modify' $
-          \s@(CPUState _ ls (r:rs) _ _ _ st) -> s {leftInss = r : ls, rightInss = rs, cpuSteps = st + 1}
+          \s@(CPU _ ls (r:rs) _ _ _ st) -> s {leftInss = r : ls, rightInss = rs, cpuSteps = st + 1}
 
-putLI :: Instruction -> State CPUState ()
+putLI :: Instruction -> State CPU ()
 putLI i = modify' $ \s -> s {lastIns = Just i}
 
-putReg :: RegisterID -> Word8 -> State CPUState ()
-putReg r x = modify' $ \s@CPUState {..} -> s {cpuRegs = M.insert r x cpuRegs}
+putReg :: RegisterID -> Word8 -> State CPU ()
+putReg r x = modify' $ \s@CPU {..} -> s {cpuRegs = insert r x cpuRegs}
 
-putFlag :: FlagID -> Bool -> State CPUState ()
-putFlag f b = modify' $ \s@CPUState {..} -> s {flags = M.insert f b flags}
+putFlag :: FlagID -> Bool -> State CPU ()
+putFlag f b = modify' $ \s@CPU {..} -> s {flags = insert f b flags}
 
-putFlags :: Ordering -> State CPUState ()
+putFlags :: Ordering -> State CPU ()
 putFlags = zipWithM_ putFlag [ Greater, Equal, Less  ] . \case
   GT ->                      [ True   , False, False ]
   EQ ->                      [ False  , True , False ]
   LT ->                      [ False  , False, True  ]
 
-putOutput :: Word8 -> State CPUState ()
+putOutput :: Word8 -> State CPU ()
 putOutput output = modify' $ \s -> s {output}
 
 -- we jump backwards one extra step because we increment before that
-jump :: Address -> State CPUState ()
-jump (Address a) = modify' $ \cs@(CPUState _ ls rs _ _ _ _) ->
+jump :: Address -> State CPU ()
+jump (Address a) = modify' $ \cs@(CPU _ ls rs _ _ _ _) ->
   if | a == 0    -> cs {leftInss = drop 1 ls, rightInss = take 1 ls ++ rs}
      | a > 127   -> let s             = - (fromIntegral a - 256 - 1)
                         (r, leftInss) = splitAt s ls
@@ -243,13 +243,13 @@ jump (Address a) = modify' $ \cs@(CPUState _ ls rs _ _ _ _) ->
                         (l, rightInss) = splitAt s rs
                     in cs {leftInss = ls ++ l, rightInss}
 
-getReg :: RegisterID -> State CPUState Word8
-getReg r = gets ((M.! r) . cpuRegs)
+getReg :: RegisterID -> State CPU Word8
+getReg r = gets ((! r) . cpuRegs)
 
-getFlag :: FlagID -> State CPUState Bool
-getFlag f = gets ((M.! f) . flags)
+getFlag :: FlagID -> State CPU Bool
+getFlag f = gets ((! f) . flags)
 
-eval :: Instruction -> State CPUState ()
+eval :: Instruction -> State CPU ()
 eval (ConstTo r (Constant x)) = putReg r x
 eval (Output r)               = getReg r >>= putOutput
 eval (Jump a)                 = jump a
@@ -259,7 +259,7 @@ eval (Alu1 i r)               = evalAlu1 i r
 eval (Alu2 i r)               = evalAlu2 i r
 eval Halt = return ()
 
-evalAlu1 :: Alu1Ins -> RegisterID -> State CPUState ()
+evalAlu1 :: Alu1Ins -> RegisterID -> State CPU ()
 evalAlu1 i r = do
   let f = case i of
             Negate -> negate
@@ -268,7 +268,7 @@ evalAlu1 i r = do
   putReg r x
   putFlags $ compare x 0
 
-evalAlu2 :: Alu2Ins -> RegisterID -> State CPUState ()
+evalAlu2 :: Alu2Ins -> RegisterID -> State CPU ()
 evalAlu2 i r = do
   a <- getReg RegA
   x <- getReg r
@@ -286,8 +286,8 @@ evalAlu2 i r = do
     Add -> putFlag Carry $ fromIntegral a + fromIntegral x > 255
     _   -> return ()
 
-newSimResult :: CPUState -> Result
-newSimResult CPUState {..} = Result lastIns cpuRegs output cpuSteps
+newSimResult :: CPU -> Result
+newSimResult CPU {..} = Result lastIns cpuRegs output cpuSteps
 
 prettyIns :: Instruction -> String
 prettyIns (ConstTo r c)    = "ct" ++ prettyReg r ++ " " ++ prettyConst c
@@ -331,11 +331,9 @@ prettyConst (Constant c) = "0x" ++ nChar '0' 2 (showHex c " ; ") ++ show c ++ " 
 
 prettyResults :: Charset -> [Result] -> String
 prettyResults chs = tblines . concatMap (prettyResult chs)
-  where tblines s = topLine ++ s ++ botLine
-        topLine = case chs of ASCII -> ""
-                              _     -> ansiForeground chs Cyan $ "┏" ++ replicate 45 '━' ++ "┓\n"
-        botLine = case chs of ASCII -> ""
-                              _     -> ansiForeground chs Cyan $ "┗" ++ replicate 45 '━' ++ "┛"
+  where tblines s = lineWith '┏' '┓' ++ s ++ lineWith '┗' '┛'
+        lineWith l r = case chs of ASCII -> ""
+                                   _     -> ansiForeground chs Cyan $ l : replicate 45 '━' ++ r : "\n"
 
 ansiAttribute :: Charset -> AnsiAttribute -> String -> String
 ansiAttribute chs attr = ansiNumber chs $ fromEnum attr
@@ -350,15 +348,17 @@ ansiCustom :: Charset -> String -> String -> String
 ansiCustom chs fmt s = case chs of ANSI -> "\ESC[" ++ fmt ++ "m" ++ s ++ "\ESC[m"
                                    _    -> s
 
+-- putting 3 different Charsets together makes this a bit clumsy (although
+-- I think it definitely makes sense to put Unicode and ANSI together)
 prettyResult :: Charset -> Result -> String
-prettyResult chs (Result li (M.elems -> regs) ls steps) =
+prettyResult chs (Result li (elems -> regs) ls steps) =
   line False ++ lastI ++ line True ++ regLine True ++ regsHex ++ regsU ++ regsDec ++ regLine False ++ diodes
   where
     lastI = br 1 . bl $ lastI' ++ spaces dispSteps
-    -- using nChar here makes this really confusing tbh
-    spaces = nChar ' ' (43 - length lastI' + (if isJust li then 2 else 1) * length (bw ""))
-    lastI' = maybe "" instruction li
-    instruction = ansiFg Red . ansiAttr Bold . prettyIns
+    -- using nChar here makes this a bit confusing to be honest
+    spaces = (asciiUni "       " "" ++) .
+      nChar ' ' (43 - length lastI' + maybe 1 (const 2) li * length (bw ""))
+    lastI' = maybe "" (ansiFg Red . ansiAttr Bold . prettyIns) li
     dispSteps = ansiFg Magenta . ansiAttr Bold $ show steps
     regLine isTop = br 1 . bl $ intercalate sepDist (replicate 4 $ oneReg isTop)
     oneReg isTop = case chs of ASCII -> "+---------+"
@@ -378,14 +378,10 @@ prettyResult chs (Result li (M.elems -> regs) ls steps) =
                                  _       -> ansiFg Blue " ┃"
     regSep = (regStop ++) . (sepDist ++) . regStart
     sepDist = case chs of ASCII -> "  "; _ -> " "
-    horThick n = replicate n '━'
-    diodeTopLine = asciiUni "" . br 6 . bl . yl . ("     ┏" ++) . (++ "┓") . intercalate "┯" $ map horThick [11,6,5,6]
-    diodeBotLine = asciiUni "" . br 6 . bl . yl . ("     ┗" ++) . (++ "┛") . intercalate "┷" $ map horThick [11,6,5,6]
-    diodes = diodeTopLine ++ (br 6 . bl) (asciiUni "  " (yl "     ┃ ") ++ insertSpace (map applyEnc (nChar '0' 8 $
-      showIntAtBase 2 ("01" !!) ls "")) ++ asciiUni "   hex: " (yl " │ ") ++
-      "0x" ++ bw (nChar '0' 2 $ showHex ls "") ++ asciiUni "   udec: " (yl " │ ") ++
-      wt (nChar ' ' 3 $ show ls) ++ asciiUni "    sdec: " (yl " │ ") ++ wt (nChar ' ' 4 $ sign ls) ++
-      asciiUni "" (yl " ┃")) ++ diodeBotLine
+    diodeLine l m r = asciiUni "" . br 6 . bl . yl . ("     " ++) . (l :) . (++ [r]) .
+      intercalate [m] $ map (`replicate` '━') [11,6,5,6]
+    -- XXX probably split this up according to ASCII/non-ASCII
+    diodes = diodeLine '┏' '┯' '┓' ++ (br 6 . bl) (asciiUni "  " (yl "     ┃ ") ++ insertSpace (map applyEnc (nChar '0' 8 $ showIntAtBase 2 ("01" !!) ls "")) ++ asciiUni "   hex: " (yl " │ ") ++ "0x" ++ bw (nChar '0' 2 $ showHex ls "") ++ asciiUni "   udec: " (yl " │ ") ++ wt (nChar ' ' 3 $ show ls) ++ asciiUni "    sdec: " (yl " │ ") ++ wt (nChar ' ' 4 $ sign ls) ++ asciiUni "" (yl " ┃")) ++ diodeLine '┗' '┷' '┛'
     asciiUni sa su = case chs of ASCII -> sa; _ -> su
     bw = ansiAttr Bold . ansiFg White
     yl = ansiFg Yellow
@@ -401,9 +397,8 @@ prettyResult chs (Result li (M.elems -> regs) ls steps) =
                  _     -> ansiFg Red "●"
     insertSpace (a:b:c:d:r) = concat $ a:b:c:d:" ":r
     insertSpace xs = concat xs
-    line force | isNothing li, not force  = ""
-               | otherwise                = case chs of ASCII   -> replicate 50 '_' ++ "\n\n"
-                                                        _       -> ansiFg Cyan $ '┠' : replicate 45 '─' ++ "┨\n"
+    line False | isNothing li = ""
+    line _ = asciiUni (replicate 50 '_' ++ "\n\n") . ansiFg Cyan $ '┠' : replicate 45 '─' ++ "┨\n"
 
 sign :: Word8 -> String
 sign (fromIntegral -> x) | x > 127   = show (x - 256)
@@ -412,32 +407,29 @@ sign (fromIntegral -> x) | x > 127   = show (x - 256)
 nChar :: Char -> Int -> String -> String
 nChar c n s = replicate (n - length s) c ++ s
 
-defaultCPU :: CPUState
-defaultCPU = CPUState Nothing [] [] (M.fromList $ map (,False) [Greater ..]) (M.fromList $ map (,0) [RegA ..]) 0 0
+defaultCPU :: CPU
+defaultCPU = CPU Nothing [] [] (fromList $ map (,False) [Greater ..]) (fromList $ map (,0) [RegA ..]) 0 0
 
 runCPU :: Charset -> String -> IO ()
 runCPU chs file = do
   content <- lines <$> readFile file
-  either putStrLn (run . catMaybes) $ linesToInss content
-  where run = putStr . prettyResults chs . results
-        results is = newSimResult (cpu is) : evalState simulate (cpu is)
-        cpu is = defaultCPU {rightInss = is}
+  either putStrLn (putStr . run . catMaybes) $ linesToInss content
+  where run :: [Instruction] -> String
+        run rightInss = prettyResults chs . results $ defaultCPU {rightInss}
+        results :: CPU -> [Result]
+        results = liftA2 (:) newSimResult $ evalState simulate
 
 main :: IO ()
 main = getArgs >>= \case
-  [['-', o], file] | isJust option -> fromJust option file
-    where option = lookupOption options
-          lookupOption [] = Nothing
-          lookupOption (s:ss) | o == switch s = Just $ action s
-                              | otherwise     = lookupOption ss
-  _ -> getProgName >>= putStrLn . usage
+  [['-', s], file] | Just f <- lookupAction -> f file
+    where lookupAction = action <$> find ((s ==) . switch) options
+  _ -> putStrLn . usage =<< getProgName
 
 usage :: String -> String
 usage progName = "Usage: " ++ progName ++ " -(" ++ switches ++ ") FILE\n" ++ optionDescs
   where
     switches = intersperse '|' $ map switch options
-    optionDescs =
-      unlines $ zipWith ((++) . ("  -" ++) . (:": ")) (map switch options) (map desc options)
+    optionDescs = unlines $ map (liftA2 (++) (("  -" ++) . (:": ") . switch) desc) options
 
 options :: [Option]
 options = [ Option 'p' "print both hexadecimal and the original assembly"                printHexAndOrig
