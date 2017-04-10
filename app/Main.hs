@@ -22,12 +22,9 @@ import Data.Either
 import System.Environment
 import Data.Word
 import Numeric
-import Lens.Simple
+import Control.Lens
 
 
--- TODO: maybe change it so registers is not actually a record, but a function
--- from RegisterID to RegisterContent, and then hide it through lenses
--- TODO: maybe use Control.Lens just so we can use Zoom
 -- TODO: divide into several modules
 -- TODO: allow to run only up to a certain number of steps
 -- TODO: print out in binary
@@ -49,7 +46,7 @@ data FlagStatus = Set | Unset deriving (Eq)
 newtype RegContent = RegContent {_regContent :: Word8}
   deriving (Eq, Ord, Integral, Real, Enum, Num, Bits)
 
-$(makeLenses ''RegContent)
+makeLenses ''RegContent
 
 data AnsiAttribute =
   Off | Bold | Underline | Undefined | Italic | BlinkSlow | BlinkRapid | Reverse | Conceal deriving (Enum)
@@ -67,7 +64,7 @@ data Registers = Registers { _regA :: RegContent
                            , _regD :: RegContent
                            }
 
-$(makeLenses ''Registers)
+makeLenses ''Registers
 
 data Flags = Flags { _greater :: FlagStatus
                    , _equal   :: FlagStatus
@@ -75,7 +72,7 @@ data Flags = Flags { _greater :: FlagStatus
                    , _carry   :: FlagStatus
                    }
 
-$(makeLenses ''Flags)
+makeLenses ''Flags
 
 newtype ConstNum = ConstNum Word8 deriving (Enum, Real, Num, Ord, Eq, Integral)
 
@@ -101,7 +98,7 @@ data CPU = CPU { _flags     :: Flags
                , _output    :: Word8
                }
 
-$(makeLenses ''CPU)
+makeLenses ''CPU
 
 data Simulation = Simulation { _lastIns   :: Maybe Instruction
                              , _leftInss  :: [Instruction]
@@ -110,7 +107,7 @@ data Simulation = Simulation { _lastIns   :: Maybe Instruction
                              , _cpu       :: CPU
                              }
 
-$(makeLenses ''Simulation)
+makeLenses ''Simulation
 
 data Result = Result { _resultIns   :: Maybe Instruction
                      , _resultRegs  :: Registers
@@ -118,20 +115,23 @@ data Result = Result { _resultIns   :: Maybe Instruction
                      , _resultSteps :: Integer
                      }
 
-$(makeLenses ''Result)
+makeLenses ''Result
 
 data Option = Option { _switch :: Char
                      , _desc   :: String
                      , _action :: String -> IO ()
                      }
 
-$(makeLenses ''Option)
+makeLenses ''Option
 
 register :: RegisterID -> Lens' Registers RegContent
 register RegA = regA
 register RegB = regB
 register RegC = regC
 register RegD = regD
+
+cpuReg :: RegisterID -> Lens' Simulation RegContent
+cpuReg r = cpu.registers.register r
 
 listRegisters :: Registers -> [RegContent]
 listRegisters rs = map ((rs&) . view . register) [RegA ..]
@@ -260,30 +260,26 @@ printLogisim file = do
 simulate :: State Simulation [Result]
 simulate = use rightInss >>= \case
     []    -> return []
-    (i:_) ->
-      incIns i >> eval i >> putLI i >> gets newSimResult >>= (<$> case i of Halt -> return []
-                                                                            _    -> simulate) . (:)
-  where incIns i = modify' $ (leftInss %~ (i :)) . (rightInss %~ drop 1) . (cpuSteps %~ (+1))
+    (i:_) -> do
+      incIns i
+      eval i
+      lastIns .= Just i
+      gets newSimResult >>= (<$> case i of Halt -> return []
+                                           _    -> simulate) . (:)
+  where incIns i = leftInss %= (i:) >> rightInss %= drop 1 >> cpuSteps += 1
 
-putLI :: Instruction -> State Simulation ()
-putLI i = lastIns .= Just i
+putFlag :: FlagID -> FlagStatus -> State Flags ()
+putFlag = assign . flag
 
-putReg :: RegisterID -> RegContent -> State Simulation ()
-putReg r = assign $ cpu.registers.register r
-
-putFlag :: FlagID -> FlagStatus -> State Simulation ()
-putFlag f = assign $ cpu.flags.flag f
-
-putFlags :: Ordering -> State Simulation ()
+putFlags :: Ordering -> State Flags ()
 putFlags = zipWithM_ putFlag [ Greater, Equal, Less  ] . \case
   GT ->                      [ Set    , Unset, Unset ]
   EQ ->                      [ Unset  , Set  , Unset ]
   LT ->                      [ Unset  , Unset, Set   ]
 
-putOutput :: Word8 -> State Simulation ()
-putOutput = assign $ cpu.output
-
 -- we jump backwards one extra step because we increment before that
+-- XXX when changing Inss to array, this must change type, because only the
+-- instruction pointer has to be updated
 jump :: Address -> State Simulation ()
 jump (Address a) = modify' $ \ss -> let ls = ss^.leftInss
                                         rs = ss^.rightInss in
@@ -295,18 +291,15 @@ jump (Address a) = modify' $ \ss -> let ls = ss^.leftInss
                          (l, rs') = splitAt s rs
                      in (leftInss %~ (++ l)) . (rightInss .~ rs')) ss
 
-getReg :: RegisterID -> State Simulation RegContent
-getReg r = use $ cpu.registers.register r
-
 getFlag :: FlagID -> State Simulation FlagStatus
 getFlag f = use $ cpu.flags.flag f
 
 eval :: Instruction -> State Simulation ()
-eval (ConstTo r (ConstNum x)) = putReg r $ RegContent x
-eval (Output r)               = putOutput . view regContent =<< getReg r
+eval (ConstTo r (ConstNum x)) = cpuReg r .= RegContent x
+eval (Output r)               = (cpu.output .=) =<< use (cpuReg r.regContent)
 eval (Jump a)                 = jump a
 eval (JumpIf f a)             = (when ?? jump a) . (== Set) =<< getFlag f
-eval (CopyFromRegA r)         = putReg r =<< getReg RegA
+eval (CopyFromRegA r)         = (cpuReg r .=) =<< use (cpuReg RegA)
 eval (Alu1 i r)               = evalAlu1 i r
 eval (Alu2 i r)               = evalAlu2 i r
 eval Halt = return ()
@@ -316,14 +309,14 @@ evalAlu1 i r = do
   let f = case i of
             Negate -> negate
             Not    -> complement
-  x <- f <$> getReg r
-  putReg r x
-  putFlags $ compare x 0
+  x <- f <$> use (cpuReg r)
+  cpuReg r .= x
+  zoom (cpu.flags) . putFlags $ compare x 0
 
 evalAlu2 :: Alu2Ins -> RegisterID -> State Simulation ()
 evalAlu2 i r = do
-  a <- getReg RegA
-  x <- getReg r
+  a <- use (cpuReg RegA)
+  x <- use (cpuReg r)
   let res = (case i of
         Add        -> (+)
         ShiftLeft  -> (. fromIntegral) . shiftL
@@ -332,10 +325,10 @@ evalAlu2 i r = do
         Or         -> (.|.)
         Xor        -> xor)
         a x
-  putReg RegA res
-  putFlags $ compare res 0
+  cpuReg RegA .= res
+  zoom (cpu.flags) . putFlags $ compare res 0
   case i of
-    Add -> putFlag Carry . bool Unset Set $ fromIntegral a + fromIntegral x > 255
+    Add -> zoom (cpu.flags) . putFlag Carry . bool Unset Set $ fromIntegral a + fromIntegral x > 255
     _   -> return ()
 
 newSimResult :: Simulation -> Result
