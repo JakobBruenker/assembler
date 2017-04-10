@@ -95,16 +95,21 @@ data Instruction = ConstTo RegisterID ConstNum
                  | Halt
                  deriving (Show)
 
-data CPU = CPU { _lastIns   :: Maybe Instruction
-               , _leftInss  :: [Instruction]
-               , _rightInss :: [Instruction]
-               , _flags     :: Map FlagID FlagStatus
-               , _cpuRegs   :: Map RegisterID RegContent
-               , _output    :: Word8
-               , _cpuSteps  :: Integer
+data CPU = CPU { _flags   :: Map FlagID FlagStatus
+               , _cpuRegs :: Map RegisterID RegContent
+               , _output  :: Word8
                } deriving (Show)
 
 $(makeLenses ''CPU)
+
+data Simulation = Simulation { _lastIns   :: Maybe Instruction
+                                       , _leftInss  :: [Instruction]
+                                       , _rightInss :: [Instruction]
+                                       , _cpuSteps  :: Integer
+                                       , _cpu       :: CPU
+                                       }
+
+$(makeLenses ''Simulation)
 
 data Result = Result { _resultIns   :: Maybe Instruction
                      , _resultRegs  :: Map RegisterID RegContent
@@ -236,7 +241,7 @@ printLogisim file = do
   putStrLn . ("v2.0 raw\n" ++) . unlines . either pure (map insToHex . catMaybes) $
     linesToInss content
 
-simulate :: State CPU [Result]
+simulate :: State Simulation [Result]
 simulate = use rightInss >>= \case
     []    -> return []
     (i:_) ->
@@ -244,53 +249,53 @@ simulate = use rightInss >>= \case
                                                                             _    -> simulate) . (:)
   where incIns i = modify' $ (leftInss %~ (i :)) . (rightInss %~ drop 1) . (cpuSteps %~ (+1))
 
-putLI :: Instruction -> State CPU ()
+putLI :: Instruction -> State Simulation ()
 putLI i = lastIns .= Just i
 
-putReg :: RegisterID -> RegContent -> State CPU ()
-putReg r v = cpuRegs.at r .= Just v
+putReg :: RegisterID -> RegContent -> State Simulation ()
+putReg r v = cpu.cpuRegs.at r .= Just v
 
-putFlag :: FlagID -> FlagStatus -> State CPU ()
-putFlag f b = flags.at f .= Just b
+putFlag :: FlagID -> FlagStatus -> State Simulation ()
+putFlag f b = cpu.flags.at f .= Just b
 
-putFlags :: Ordering -> State CPU ()
+putFlags :: Ordering -> State Simulation ()
 putFlags = zipWithM_ putFlag [ Greater, Equal, Less  ] . \case
   GT ->                      [ Set    , Unset, Unset ]
   EQ ->                      [ Unset  , Set  , Unset ]
   LT ->                      [ Unset  , Unset, Set   ]
 
-putOutput :: Word8 -> State CPU ()
-putOutput = modify' . set output
+putOutput :: Word8 -> State Simulation ()
+putOutput = assign $ cpu.output
 
 -- we jump backwards one extra step because we increment before that
-jump :: Address -> State CPU ()
-jump (Address a) = modify' $ \cpu -> let ls = cpu^.leftInss
-                                         rs = cpu^.rightInss in
+jump :: Address -> State Simulation ()
+jump (Address a) = modify' $ \ss -> let ls = ss^.leftInss
+                                        rs = ss^.rightInss in
   (if | a == 0    -> (leftInss %~ drop 1) . (rightInss %~ (take 1 ls ++))
       | a > 127   -> let s = - (fromIntegral a - 256 - 1)
                          (r, ls') = splitAt s ls
                      in (leftInss .~ ls') . (rightInss %~ (reverse r ++))
       | otherwise -> let s = fromIntegral a - 1
                          (l, rs') = splitAt s rs
-                     in (leftInss %~ (++ l)) . (rightInss .~ rs')) cpu
+                     in (leftInss %~ (++ l)) . (rightInss .~ rs')) ss
 
-getReg :: RegisterID -> State CPU RegContent
-getReg r = use $ cpuRegs.at r._Just
+getReg :: RegisterID -> State Simulation RegContent
+getReg r = use $ cpu.cpuRegs.at r._Just
 
-getFlag :: FlagID -> State CPU FlagStatus
-getFlag f = use $ flags.at f._Just
+getFlag :: FlagID -> State Simulation FlagStatus
+getFlag f = use $ cpu.flags.at f._Just
 
-eval :: Instruction -> State CPU ()
+eval :: Instruction -> State Simulation ()
 eval (ConstTo r (ConstNum x)) = putReg r $ RegContent x
 eval (Output r)               = putOutput . view regContent =<< getReg r
 eval (Jump a)                 = jump a
-eval (JumpIf f a)             = getFlag f >>= \b -> when (b == Set) $ jump a
-eval (CopyFromRegA r)         = getReg RegA >>= putReg r
+eval (JumpIf f a)             = (when ?? jump a) . (== Set) =<< getFlag f
+eval (CopyFromRegA r)         = putReg r =<< getReg RegA
 eval (Alu1 i r)               = evalAlu1 i r
 eval (Alu2 i r)               = evalAlu2 i r
 eval Halt = return ()
 
-evalAlu1 :: Alu1Ins -> RegisterID -> State CPU ()
+evalAlu1 :: Alu1Ins -> RegisterID -> State Simulation ()
 evalAlu1 i r = do
   let f = case i of
             Negate -> negate
@@ -299,7 +304,7 @@ evalAlu1 i r = do
   putReg r x
   putFlags $ compare x 0
 
-evalAlu2 :: Alu2Ins -> RegisterID -> State CPU ()
+evalAlu2 :: Alu2Ins -> RegisterID -> State Simulation ()
 evalAlu2 i r = do
   a <- getReg RegA
   x <- getReg r
@@ -317,12 +322,12 @@ evalAlu2 i r = do
     Add -> putFlag Carry . bool Unset Set $ fromIntegral a + fromIntegral x > 255
     _   -> return ()
 
-newSimResult :: CPU -> Result
-newSimResult cpu = Result { _resultIns   = cpu^.lastIns
-                          , _resultRegs  = cpu^.cpuRegs
-                          , _leds        = cpu^.output
-                          , _resultSteps = cpu^.cpuSteps
-                          }
+newSimResult :: Simulation -> Result
+newSimResult ss = Result { _resultIns   = ss^.lastIns
+                         , _resultRegs  = ss^.cpu.cpuRegs
+                         , _leds        = ss^.cpu.output
+                         , _resultSteps = ss^.cpuSteps
+                         }
 
 prettyIns :: Instruction -> String
 prettyIns (ConstTo r c)    = "ct" ++ prettyReg r ++ " " ++ prettyConst c
@@ -441,24 +446,29 @@ sign = show . (bool id (subtract 256) =<< (> 127)) .  fromIntegral
 nChar :: Char -> Int -> String -> String
 nChar c n s = replicate (n - length s) c ++ s
 
-defaultCPU :: CPU
-defaultCPU = CPU
+defaultSimulation :: Simulation
+defaultSimulation = Simulation
   { _lastIns   = Nothing
   , _leftInss  = []
   , _rightInss = []
-  , _flags     = fromList $ map (,Unset) [Greater ..]
-  , _cpuRegs   = fromList $ map (,0) [RegA ..]
-  , _output    = 0
   , _cpuSteps  = 0
+  , _cpu       = defaultCPU
   }
 
-runCPU :: Charset -> String -> IO ()
-runCPU chs file = do
+defaultCPU :: CPU
+defaultCPU = CPU
+  { _flags     = fromList $ map (,Unset) [Greater ..]
+  , _cpuRegs   = fromList $ map (,0) [RegA ..]
+  , _output    = 0
+  }
+
+runSimulation :: Charset -> String -> IO ()
+runSimulation chs file = do
   content <- lines <$> readFile file
   either putStrLn (putStr . run . catMaybes) $ linesToInss content
   where run :: [Instruction] -> String
-        run = prettyResults chs . results . (set rightInss ?? defaultCPU)
-        results :: CPU -> [Result]
+        run = prettyResults chs . results . (set rightInss ?? defaultSimulation)
+        results :: Simulation -> [Result]
         results = (:) <$> newSimResult <*> evalState simulate
 
 main :: IO ()
@@ -477,7 +487,7 @@ options = map (\(a,b,c) -> Option a b c)
    [( 'p', "print both hexadecimal and the original assembly"             , printHexAndOrig
   ),( 'h', "print only hexadecimal"                                       , printHex
   ),( 'l', "print in Logisim ROM format"                                  , printLogisim
-  ),( 'r', "simulate the CPU (ASCII output)"                              , runCPU ASCII
-  ),( 'u', "simulate the CPU (Unicode output)"                            , runCPU Unicode
-  ),( 'a', "simulate the CPU (Unicode output using ANSI Escape Sequences)", runCPU ANSI
+  ),( 'r', "simulate the CPU (ASCII output)"                              , runSimulation ASCII
+  ),( 'u', "simulate the CPU (Unicode output)"                            , runSimulation Unicode
+  ),( 'a', "simulate the CPU (Unicode output using ANSI Escape Sequences)", runSimulation ANSI
   )]
