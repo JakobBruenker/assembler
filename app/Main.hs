@@ -23,13 +23,12 @@ import System.Environment
 import Data.Word
 import Numeric
 import Control.Lens
+import Data.Array
 
 
 -- TODO: divide into several modules
 -- TODO: allow to run only up to a certain number of steps
 -- TODO: print out in binary
--- TODO: maybe change from using _leftInss and _rightInss to using just an array
--- (or a list) of Instructions and an instruction pointer
 -- TODO: add support for labels
 -- TODO: add linenumbers to instructions
 -- TODO: add instruction to negate _flags
@@ -101,8 +100,8 @@ data CPU = CPU { _flags     :: Flags
 makeLenses ''CPU
 
 data Simulation = Simulation { _lastIns   :: Maybe Instruction
-                             , _leftInss  :: [Instruction]
-                             , _rightInss :: [Instruction]
+                             , _instrs    :: Array Int Instruction
+                             , _instrPtr  :: Int
                              , _cpuSteps  :: Integer
                              , _cpu       :: CPU
                              }
@@ -257,16 +256,23 @@ printLogisim file = do
   putStrLn . ("v2.0 raw\n" ++) . unlines . either pure (map insToHex . catMaybes) $
     linesToInss content
 
+(!?) :: (Ix i) => Array i e -> i -> Maybe e
+arr !? i | inRange (bounds arr) i = Just $ arr ! i
+         | otherwise              = Nothing
+
 simulate :: State Simulation [Result]
-simulate = use rightInss >>= \case
-    []    -> return []
-    (i:_) -> do
-      incIns i
-      eval i
-      lastIns .= Just i
-      gets newSimResult >>= (<$> case i of Halt -> return []
-                                           _    -> simulate) . (:)
-  where incIns i = leftInss %= (i:) >> rightInss %= drop 1 >> cpuSteps += 1
+simulate = do
+    ins <- use instrs
+    ind <- use instrPtr
+    case ins !? ind of
+      Nothing -> return []
+      Just i  -> do
+        cpuSteps += 1
+        instrPtr += 1
+        eval i
+        lastIns .= Just i
+        gets newSimResult >>= (<$> case i of Halt -> return []
+                                             _    -> simulate) . (:)
 
 putFlag :: FlagID -> FlagStatus -> State Flags ()
 putFlag = assign . flag
@@ -280,16 +286,18 @@ putFlags = zipWithM_ putFlag [ Greater, Equal, Less  ] . \case
 -- we jump backwards one extra step because we increment before that
 -- XXX when changing Inss to array, this must change type, because only the
 -- instruction pointer has to be updated
-jump :: Address -> State Simulation ()
-jump (Address a) = modify' $ \ss -> let ls = ss^.leftInss
-                                        rs = ss^.rightInss in
-  (if | a == 0    -> (leftInss %~ drop 1) . (rightInss %~ (take 1 ls ++))
-      | a > 127   -> let s = - (fromIntegral a - 256 - 1)
-                         (r, ls') = splitAt s ls
-                     in (leftInss .~ ls') . (rightInss %~ (reverse r ++))
-      | otherwise -> let s = fromIntegral a - 1
-                         (l, rs') = splitAt s rs
-                     in (leftInss %~ (++ l)) . (rightInss .~ rs')) ss
+-- jump :: Address -> State Simulation ()
+-- jump (Address a) = modify' $ \ss -> let ls = ss^.leftInss
+--                                         rs = ss^.rightInss in
+--   (if | a == 0    -> (leftInss %~ drop 1) . (rightInss %~ (take 1 ls ++))
+--       | a > 127   -> let s = - (fromIntegral a - 256 - 1)
+--                          (r, ls') = splitAt s ls
+--                      in (leftInss .~ ls') . (rightInss %~ (reverse r ++))
+--       | otherwise -> let s = fromIntegral a - 1
+--                          (l, rs') = splitAt s rs
+--                      in (leftInss %~ (++ l)) . (rightInss .~ rs')) ss
+jump :: Address -> State Int ()
+jump (Address a) = id += sign a - 1
 
 getFlag :: FlagID -> State Simulation FlagStatus
 getFlag f = use $ cpu.flags.flag f
@@ -297,8 +305,8 @@ getFlag f = use $ cpu.flags.flag f
 eval :: Instruction -> State Simulation ()
 eval (ConstTo r (ConstNum x)) = cpuReg r .= RegContent x
 eval (Output r)               = (cpu.output .=) =<< use (cpuReg r.regContent)
-eval (Jump a)                 = jump a
-eval (JumpIf f a)             = (when ?? jump a) . (== Set) =<< getFlag f
+eval (Jump a)                 = zoom instrPtr $ jump a
+eval (JumpIf f a)             = (when ?? zoom instrPtr (jump a)) . (== Set) =<< getFlag f
 eval (CopyFromRegA r)         = (cpuReg r .=) =<< use (cpuReg RegA)
 eval (Alu1 i r)               = evalAlu1 i r
 eval (Alu2 i r)               = evalAlu2 i r
@@ -310,7 +318,7 @@ evalAlu1 i r = do
             Negate -> negate
             Not    -> complement
   x <- f <$> use (cpuReg r)
-  cpuReg r .= x
+  cpuReg r .= f x
   zoom (cpu.flags) . putFlags $ compare x 0
 
 evalAlu2 :: Alu2Ins -> RegisterID -> State Simulation ()
@@ -367,7 +375,7 @@ prettyFlagID Less    = "l"
 prettyFlagID Carry   = "c"
 
 prettyAddress :: Address -> String
-prettyAddress (Address a) = sign a
+prettyAddress (Address a) = show $ sign a
 
 prettyReg :: RegisterID -> String
 prettyReg RegA = "a"
@@ -376,7 +384,7 @@ prettyReg RegC = "c"
 prettyReg RegD = "d"
 
 prettyConst :: ConstNum -> String
-prettyConst (ConstNum c) = "0x" ++ nChar '0' 2 (showHex c " ; ") ++ show c ++ " ; " ++ sign c
+prettyConst (ConstNum c) = "0x" ++ nChar '0' 2 (showHex c " ; ") ++ show c ++ " ; " ++ show (sign c)
 
 prettyResults :: Charset -> [Result] -> String
 prettyResults chs = tblines . concatMap (prettyResult chs)
@@ -419,7 +427,7 @@ prettyResult chs (Result li (map (^.regContent) . listRegisters -> regs) ls step
       "0x" ++ bw (nChar '0' 2 $ showHex r "")) ['A'..] regs
     regsU = br 1 . bl $ mkRegs True $ map (((case chs of ASCII -> "    "; _ -> ansiFg Blue "─┘  ") ++) . wt .
       nChar ' ' 3 . show) regs
-    regsDec = br 1 . bl $ mkRegs False $ map (ansiFg White . ("   " ++) . nChar ' ' 4 . sign) regs
+    regsDec = br 1 . bl $ mkRegs False $ map (ansiFg White . ("   " ++) . nChar ' ' 4 . show . sign) regs
     mkRegs isMid rs = regStart isMid ++ intercalate (regSep isMid) rs ++ regStop
     regStart isMid = case chs of ASCII   -> "| "
                                  _       -> ansiFg Blue $ if isMid then "┠" else "┃"
@@ -430,7 +438,7 @@ prettyResult chs (Result li (map (^.regContent) . listRegisters -> regs) ls step
     diodeLine l m r = asciiUni "" . br 6 . bl . yl . ("     " ++) . (l :) . (++ [r]) .
       intercalate [m] $ map (`replicate` '━') [11,6,5,6]
     -- XXX probably split this up according to ASCII/non-ASCII
-    diodes = diodeLine '┏' '┯' '┓' ++ (br 6 . bl) (asciiUni "  " (yl "     ┃ ") ++ insertSpace (map applyEnc (nChar '0' 8 $ showIntAtBase 2 ("01" !!) ls "")) ++ asciiUni "   hex: " (yl " │ ") ++ "0x" ++ bw (nChar '0' 2 $ showHex ls "") ++ asciiUni "   udec: " (yl " │ ") ++ wt (nChar ' ' 3 $ show ls) ++ asciiUni "    sdec: " (yl " │ ") ++ wt (nChar ' ' 4 $ sign ls) ++ asciiUni "" (yl " ┃")) ++ diodeLine '┗' '┷' '┛'
+    diodes = diodeLine '┏' '┯' '┓' ++ (br 6 . bl) (asciiUni "  " (yl "     ┃ ") ++ insertSpace (map applyEnc (nChar '0' 8 $ showIntAtBase 2 ("01" !!) ls "")) ++ asciiUni "   hex: " (yl " │ ") ++ "0x" ++ bw (nChar '0' 2 $ showHex ls "") ++ asciiUni "   udec: " (yl " │ ") ++ wt (nChar ' ' 3 $ show ls) ++ asciiUni "    sdec: " (yl " │ ") ++ wt (nChar ' ' 4 . show $ sign ls) ++ asciiUni "" (yl " ┃")) ++ diodeLine '┗' '┷' '┛'
     asciiUni sa su = case chs of ASCII -> sa; _ -> su
     bw = ansiAttr Bold . ansiFg White
     yl = ansiFg Yellow
@@ -449,8 +457,8 @@ prettyResult chs (Result li (map (^.regContent) . listRegisters -> regs) ls step
     line False | isNothing li = ""
     line _ = asciiUni (replicate 50 '_' ++ "\n\n") . ansiFg Cyan $ '┠' : replicate 45 '─' ++ "┨\n"
 
-sign :: Word8 -> String
-sign = show . (bool id (subtract 256) =<< (> 127)) .  fromIntegral
+sign :: Word8 -> Int
+sign = (bool id (subtract 256) =<< (> 127)) .  fromIntegral
 
 nChar :: Char -> Int -> String -> String
 nChar c n s = replicate (n - length s) c ++ s
@@ -458,8 +466,8 @@ nChar c n s = replicate (n - length s) c ++ s
 defaultSimulation :: Simulation
 defaultSimulation = Simulation
   { _lastIns   = Nothing
-  , _leftInss  = []
-  , _rightInss = []
+  , _instrs    = array (1,0) []
+  , _instrPtr  = 0
   , _cpuSteps  = 0
   , _cpu       = defaultCPU
   }
@@ -476,7 +484,8 @@ runSimulation chs file = do
   content <- lines <$> readFile file
   either putStrLn (putStr . run . catMaybes) $ linesToInss content
   where run :: [Instruction] -> String
-        run = prettyResults chs . results . (set rightInss ?? defaultSimulation)
+        run is =
+          prettyResults chs . results . (set instrs ?? defaultSimulation) . listArray (0, length is - 1) $ is
         results :: Simulation -> [Result]
         results = (:) <$> newSimResult <*> evalState simulate
 
