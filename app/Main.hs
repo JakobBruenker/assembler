@@ -7,6 +7,7 @@
 {-# LANGUAGE TupleSections              #-}
 {-# LANGUAGE TemplateHaskell            #-}
 {-# LANGUAGE FlexibleContexts           #-}
+{-# LANGUAGE Rank2Types                 #-}
 
 module Main where
 
@@ -21,16 +22,12 @@ import Data.Either
 import System.Environment
 import Data.Word
 import Numeric
-import Data.Map.Strict hiding (map, lookup, null)
 import Lens.Simple
 
 
--- TODO: since lenses makes it so convenient, we might actually reintroduce
--- CPUState
--- TODO: maybe change flags and registers a bit further - at this point we
--- *could* something weird where we replace RegisterID with a lens, but
--- probably a bad idea.. unless... I guess if we hide it inside a module no one
--- would have to know
+-- TODO: maybe change it so registers is not actually a record, but a function
+-- from RegisterID to RegisterContent, and then hide it through lenses
+-- TODO: maybe use Control.Lens just so we can use Zoom
 -- TODO: divide into several modules
 -- TODO: allow to run only up to a certain number of steps
 -- TODO: print out in binary
@@ -47,43 +44,48 @@ import Lens.Simple
 -- don't need signed one because you can get it from anding with 1000 0000, or
 -- something
 
-data FlagStatus = Set | Unset deriving (Eq, Show)
-
-instance Monoid FlagStatus where
-  mempty = Unset
-  mappend Set _ = Set
-  mappend _   y = y
+data FlagStatus = Set | Unset deriving (Eq)
 
 newtype RegContent = RegContent {_regContent :: Word8}
-  deriving (Eq, Ord, Integral, Real, Enum, Num, Show, Bits)
+  deriving (Eq, Ord, Integral, Real, Enum, Num, Bits)
 
 $(makeLenses ''RegContent)
 
-instance Monoid RegContent where
-  mempty = 0
-  mappend x y = x + y
-
 data AnsiAttribute =
-  Off | Bold | Underline | Undefined | Italic | BlinkSlow | BlinkRapid | Reverse | Conceal deriving (Show, Enum)
+  Off | Bold | Underline | Undefined | Italic | BlinkSlow | BlinkRapid | Reverse | Conceal deriving (Enum)
 
 data AnsiColor =
-  Black | Red | Green | Yellow | Blue | Magenta | Cyan | White deriving (Show, Enum)
+  Black | Red | Green | Yellow | Blue | Magenta | Cyan | White deriving (Enum)
 
 data Charset = ASCII | Unicode | ANSI
 
-data FlagID = Greater | Equal | Less | Carry deriving (Enum, Eq, Ord, Show)
+data FlagID = Greater | Equal | Less | Carry deriving (Enum, Eq, Ord)
 
-type CPURegs = (RegContent, RegContent, RegContent, RegContent)
+data Registers = Registers { _regA :: RegContent
+                           , _regB :: RegContent
+                           , _regC :: RegContent
+                           , _regD :: RegContent
+                           }
 
-newtype ConstNum = ConstNum Word8 deriving (Show, Enum, Real, Num, Ord, Eq, Integral)
+$(makeLenses ''Registers)
 
-data RegisterID = RegA | RegB | RegC | RegD deriving (Enum, Eq, Ord, Show)
+data Flags = Flags { _greater :: FlagStatus
+                   , _equal   :: FlagStatus
+                   , _less    :: FlagStatus
+                   , _carry   :: FlagStatus
+                   }
 
-newtype Address = Address Word8 deriving (Show, Enum, Real, Num, Ord, Eq, Integral)
+$(makeLenses ''Flags)
 
-data Alu1Ins = Negate | Not deriving (Show)
+newtype ConstNum = ConstNum Word8 deriving (Enum, Real, Num, Ord, Eq, Integral)
 
-data Alu2Ins = Add | ShiftLeft | ShiftRight | And | Or | Xor deriving (Show)
+data RegisterID = RegA | RegB | RegC | RegD deriving (Enum)
+
+newtype Address = Address Word8 deriving (Enum, Real, Num, Ord, Eq, Integral)
+
+data Alu1Ins = Negate | Not
+
+data Alu2Ins = Add | ShiftLeft | ShiftRight | And | Or | Xor
 
 data Instruction = ConstTo RegisterID ConstNum
                  | Output RegisterID
@@ -93,29 +95,28 @@ data Instruction = ConstTo RegisterID ConstNum
                  | Alu1 Alu1Ins RegisterID
                  | Alu2 Alu2Ins RegisterID
                  | Halt
-                 deriving (Show)
 
-data CPU = CPU { _flags   :: Map FlagID FlagStatus
-               , _cpuRegs :: Map RegisterID RegContent
-               , _output  :: Word8
-               } deriving (Show)
+data CPU = CPU { _flags     :: Flags
+               , _registers :: Registers
+               , _output    :: Word8
+               }
 
 $(makeLenses ''CPU)
 
 data Simulation = Simulation { _lastIns   :: Maybe Instruction
-                                       , _leftInss  :: [Instruction]
-                                       , _rightInss :: [Instruction]
-                                       , _cpuSteps  :: Integer
-                                       , _cpu       :: CPU
-                                       }
+                             , _leftInss  :: [Instruction]
+                             , _rightInss :: [Instruction]
+                             , _cpuSteps  :: Integer
+                             , _cpu       :: CPU
+                             }
 
 $(makeLenses ''Simulation)
 
 data Result = Result { _resultIns   :: Maybe Instruction
-                     , _resultRegs  :: Map RegisterID RegContent
+                     , _resultRegs  :: Registers
                      , _leds        :: Word8
                      , _resultSteps :: Integer
-                     } deriving (Show)
+                     }
 
 $(makeLenses ''Result)
 
@@ -125,6 +126,21 @@ data Option = Option { _switch :: Char
                      }
 
 $(makeLenses ''Option)
+
+register :: RegisterID -> Lens' Registers RegContent
+register RegA = regA
+register RegB = regB
+register RegC = regC
+register RegD = regD
+
+listRegisters :: Registers -> [RegContent]
+listRegisters rs = map ((rs&) . view . register) [RegA ..]
+
+flag :: FlagID -> Lens' Flags FlagStatus
+flag Greater = greater
+flag Equal   = equal
+flag Less    = less
+flag Carry   = carry
 
 stringsToIns :: [String] -> Either String Instruction
 stringsToIns [['c', 't', r], c] | isReg = Right . ConstTo (head reg) =<< readC
@@ -253,10 +269,10 @@ putLI :: Instruction -> State Simulation ()
 putLI i = lastIns .= Just i
 
 putReg :: RegisterID -> RegContent -> State Simulation ()
-putReg r v = cpu.cpuRegs.at r .= Just v
+putReg r = assign $ cpu.registers.register r
 
 putFlag :: FlagID -> FlagStatus -> State Simulation ()
-putFlag f b = cpu.flags.at f .= Just b
+putFlag f = assign $ cpu.flags.flag f
 
 putFlags :: Ordering -> State Simulation ()
 putFlags = zipWithM_ putFlag [ Greater, Equal, Less  ] . \case
@@ -280,10 +296,10 @@ jump (Address a) = modify' $ \ss -> let ls = ss^.leftInss
                      in (leftInss %~ (++ l)) . (rightInss .~ rs')) ss
 
 getReg :: RegisterID -> State Simulation RegContent
-getReg r = use $ cpu.cpuRegs.at r._Just
+getReg r = use $ cpu.registers.register r
 
 getFlag :: FlagID -> State Simulation FlagStatus
-getFlag f = use $ cpu.flags.at f._Just
+getFlag f = use $ cpu.flags.flag f
 
 eval :: Instruction -> State Simulation ()
 eval (ConstTo r (ConstNum x)) = putReg r $ RegContent x
@@ -324,7 +340,7 @@ evalAlu2 i r = do
 
 newSimResult :: Simulation -> Result
 newSimResult ss = Result { _resultIns   = ss^.lastIns
-                         , _resultRegs  = ss^.cpu.cpuRegs
+                         , _resultRegs  = ss^.cpu.registers
                          , _leds        = ss^.cpu.output
                          , _resultSteps = ss^.cpuSteps
                          }
@@ -391,7 +407,7 @@ ansiCustom chs fmt s = case chs of ANSI -> "\ESC[" ++ fmt ++ "m" ++ s ++ "\ESC[m
 -- putting 3 different Charsets together makes this a bit clumsy (although
 -- I think it definitely makes sense to put Unicode and ANSI together)
 prettyResult :: Charset -> Result -> String
-prettyResult chs (Result li (map (^.regContent) . elems -> regs) ls steps) =
+prettyResult chs (Result li (map (^.regContent) . listRegisters -> regs) ls steps) =
   line False ++ lastI ++ line True ++ regLine True ++ regsHex ++ regsU ++ regsDec ++ regLine False ++ diodes
   where
     lastI = br 1 . bl $ lastI' ++ spaces dispSteps
@@ -457,8 +473,8 @@ defaultSimulation = Simulation
 
 defaultCPU :: CPU
 defaultCPU = CPU
-  { _flags     = fromList $ map (,Unset) [Greater ..]
-  , _cpuRegs   = fromList $ map (,0) [RegA ..]
+  { _flags     = Flags Unset Unset Unset Unset
+  , _registers = Registers 0 0 0 0
   , _output    = 0
   }
 
