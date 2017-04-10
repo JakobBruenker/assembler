@@ -11,6 +11,7 @@ module Main where
 import Control.Applicative
 import Control.Monad.State
 import Data.Bits
+import Data.Bool
 import Data.Maybe
 import Data.Char
 import Data.List hiding (insert)
@@ -272,14 +273,14 @@ evalAlu2 :: Alu2Ins -> RegisterID -> State CPU ()
 evalAlu2 i r = do
   a <- getReg RegA
   x <- getReg r
-  let f = flip $ case i of
-            Add        -> (+)
-            ShiftLeft  -> flip shiftL . fromIntegral
-            ShiftRight -> flip shiftR . fromIntegral
-            And        -> (.&.)
-            Or         -> (.|.)
-            Xor        -> xor
-  let res =  f a x
+  let res = (case i of
+        Add        -> (+)
+        ShiftLeft  -> (. fromIntegral) . shiftL
+        ShiftRight -> (. fromIntegral) . shiftR
+        And        -> (.&.)
+        Or         -> (.|.)
+        Xor        -> xor)
+        a x
   putReg RegA res
   putFlags $ compare res 0
   case i of
@@ -287,7 +288,12 @@ evalAlu2 i r = do
     _   -> return ()
 
 newSimResult :: CPU -> Result
-newSimResult CPU {..} = Result lastIns cpuRegs output cpuSteps
+newSimResult CPU {..} = Result
+  { resultIns   = lastIns
+  , resultRegs  = cpuRegs
+  , leds        = output
+  , resultSteps = cpuSteps
+  }
 
 prettyIns :: Instruction -> String
 prettyIns (ConstTo r c)    = "ct" ++ prettyReg r ++ " " ++ prettyConst c
@@ -401,14 +407,21 @@ prettyResult chs (Result li (elems -> regs) ls steps) =
     line _ = asciiUni (replicate 50 '_' ++ "\n\n") . ansiFg Cyan $ '┠' : replicate 45 '─' ++ "┨\n"
 
 sign :: Word8 -> String
-sign (fromIntegral -> x) | x > 127   = show (x - 256)
-                         | otherwise = show x
+sign = show . (bool id (subtract 256) =<< (> 127)) .  fromIntegral
 
 nChar :: Char -> Int -> String -> String
 nChar c n s = replicate (n - length s) c ++ s
 
 defaultCPU :: CPU
-defaultCPU = CPU Nothing [] [] (fromList $ map (,False) [Greater ..]) (fromList $ map (,0) [RegA ..]) 0 0
+defaultCPU = CPU
+  { lastIns   = Nothing
+  , leftInss  = []
+  , rightInss = []
+  , flags     = fromList $ map (,False) [Greater ..]
+  , cpuRegs   = fromList $ map (,0) [RegA ..]
+  , output    = 0
+  , cpuSteps  = 0
+  }
 
 runCPU :: Charset -> String -> IO ()
 runCPU chs file = do
@@ -421,8 +434,7 @@ runCPU chs file = do
 
 main :: IO ()
 main = getArgs >>= \case
-  [['-', s], file] | Just f <- lookupAction -> f file
-    where lookupAction = action <$> find ((s ==) . switch) options
+  [['-', s], file] | Just f <- action <$> find ((s ==) . switch) options -> f file
   _ -> putStrLn . usage =<< getProgName
 
 usage :: String -> String
