@@ -22,11 +22,12 @@ library
 executable assembler
   hs-source-dirs:      app
   main-is:             Main.hs
-  ghc-options:         -threaded -rtsopts -with-rtsopts=-N -Wall -Wno-type-defaults
+  ghc-options:         -threaded -rtsopts -with-rtsopts=-N -Wall -Wno-type-defaults -Wno-missing-signatures
   build-depends:       base
                      , assembler
                      , mtl >= 2.2 && < 3
                      , containers >= 0.5 && < 1
+                     , lens-simple >= 0.1 && < 0.2
   default-language:    Haskell2010
 
 test-suite assembler-test
