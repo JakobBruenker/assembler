@@ -192,7 +192,7 @@ stringToReg s = Left $ "No register named " ++ show s
 
 linesToInss :: [String] -> Either String [Maybe Instruction]
 linesToInss =
-  mapM (sequenceA . fmap (stringsToIns . words) . emptyLine . takeWhile (/= ';'))
+  mapM (traverse (stringsToIns . words) . emptyLine . takeWhile (/= ';'))
     where emptyLine l | all isSpace l = Nothing
                       | otherwise     = Just l
 
@@ -435,27 +435,45 @@ prettyResult chs (Result li (map (^.regContent) . listRegisters -> regs) ls step
                                  _       -> ansiFg Blue " ┃"
     regSep = (regStop ++) . (sepDist ++) . regStart
     sepDist = case chs of ASCII -> "  "; _ -> " "
-    diodeLine l m r = asciiUni "" . br 6 . bl . yl . ("     " ++) . (l :) . (++ [r]) .
-      intercalate [m] $ map (`replicate` '━') [11,6,5,6]
-    -- XXX probably split this up according to ASCII/non-ASCII
-    diodes = diodeLine '┏' '┯' '┓' ++ (br 6 . bl) (asciiUni "  " (yl "     ┃ ") ++ insertSpace (map applyEnc (nChar '0' 8 $ showIntAtBase 2 ("01" !!) ls "")) ++ asciiUni "   hex: " (yl " │ ") ++ "0x" ++ bw (nChar '0' 2 $ showHex ls "") ++ asciiUni "   udec: " (yl " │ ") ++ wt (nChar ' ' 3 $ show ls) ++ asciiUni "    sdec: " (yl " │ ") ++ wt (nChar ' ' 4 . show $ sign ls) ++ asciiUni "" (yl " ┃")) ++ diodeLine '┗' '┷' '┛'
+    diodes = asciiUni diodesASCII diodesUni
+      where
+        diodesASCII = "  " ++ lights ++ "   hex: " ++ hex ++
+          "   udec: " ++ udec ++ "   sdec: " ++ sdec ++ "\n"
+        diodesUni = diodeLine '┏' '┯' '┓' ++ (br 6 . bl)
+          (yl "     ┃ " ++ lights ++ yl " │ " ++ hex ++
+          yl " │ " ++ udec ++ yl " │ " ++ sdec ++ yl " ┃") ++
+          diodeLine '┗' '┷' '┛'
+        lights = insertSpace (map applyEnc $
+          nChar '0' 8 $ showIntAtBase 2 ("01" !!) ls "")
+        hex = "0x" ++ bw (nChar '0' 2 $ showHex ls "")
+        udec = wt . nChar ' ' 3 $ show ls
+        sdec = wt . nChar ' ' 4 . show $ sign ls
+        diodeLine l c r = br 6 . bl . yl . ("     " ++) . (l :) .
+          (++ [r]) . intercalate [c] $ map (`replicate` '━')
+          [11,6,5,6]
+        applyEnc l | l == '0' = case chs of
+                     ASCII   -> "O"
+                     Unicode -> "○"
+                     ANSI    -> ansiFg Black "●"
+                   | otherwise = case chs of
+                     ASCII -> "0"
+                     _     -> ansiFg Red "●"
     asciiUni sa su = case chs of ASCII -> sa; _ -> su
     bw = ansiAttr Bold . ansiFg White
     yl = ansiFg Yellow
     wt = ansiFg White
     bl = (asciiUni "" (ansiFg Cyan "┃ ") ++)
     br n = (++ asciiUni "\n" (ansiFg Cyan $ replicate n ' ' ++ "┃\n"))
-    applyEnc l | l == '0' = case chs of
-                 ASCII   -> "O"
-                 Unicode -> "○"
-                 ANSI    -> ansiFg Black "●"
-               | otherwise = case chs of
-                 ASCII -> "0"
-                 _     -> ansiFg Red "●"
     insertSpace (a:b:c:d:r) = concat $ a:b:c:d:" ":r
     insertSpace xs = concat xs
-    line False | isNothing li = ""
-    line _ = asciiUni (replicate 50 '_' ++ "\n\n") . ansiFg Cyan $ '┠' : replicate 45 '─' ++ "┨\n"
+    line b | b            = ln '┠' '─' '┨'
+           | isNothing li = ""
+           | otherwise    = ln '┣' '━' '┫'
+      where
+        ln l c r = asciiUni lineASCII (lineUni l c r)
+        lineASCII | b = replicate 50 '-' ++ "\n\n"
+                  | otherwise = '\n' : replicate 50 '=' ++ "\n"
+        lineUni l c r = ansiFg Cyan $ l : replicate 45 c ++ r : "\n"
 
 sign :: Word8 -> Int
 sign = (bool id (subtract 256) =<< (> 127)) .  fromIntegral
@@ -505,7 +523,7 @@ options = map (\(a,b,c) -> Option a b c)
    [( 'p', "print both hexadecimal and the original assembly"             , printHexAndOrig
   ),( 'h', "print only hexadecimal"                                       , printHex
   ),( 'l', "print in Logisim ROM format"                                  , printLogisim
-  ),( 'r', "simulate the CPU (ASCII output)"                              , runSimulation ASCII
+  ),( 'a', "simulate the CPU (ASCII output)"                              , runSimulation ASCII
   ),( 'u', "simulate the CPU (Unicode output)"                            , runSimulation Unicode
-  ),( 'a', "simulate the CPU (Unicode output using ANSI Escape Sequences)", runSimulation ANSI
+  ),( 'n', "simulate the CPU (Unicode output using ANSI Escape Sequences)", runSimulation ANSI
   )]

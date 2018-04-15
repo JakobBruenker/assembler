@@ -1,0 +1,23 @@
+cta 0xA1
+out a
+ctb 0xF
+add b
+out a
+cta 0xA1
+out a
+ctb 0xF
+add b
+out a
+cta 0xA1
+out a
+ctb 0xF
+add b
+out a
+
+;cta 5
+;mov b
+;jmp 1
+;ctb 4
+;cta 2
+;add b
+;out a
