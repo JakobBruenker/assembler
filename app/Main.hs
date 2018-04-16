@@ -11,7 +11,7 @@
 
 module Main where
 
-import Control.Applicative
+import Control.Applicative ((<|>))
 import Control.Monad.State
 import Data.Bits
 import Data.Bool
@@ -23,8 +23,7 @@ import System.Environment
 import Data.Word
 import Numeric
 import Control.Lens
-import Data.Array
-
+import Data.Vector (Vector, empty, (!?), fromList)
 
 -- TODO: divide into several modules
 -- TODO: allow to run only up to a certain number of steps
@@ -101,7 +100,7 @@ data CPU = CPU { _flags     :: Flags
 makeLenses ''CPU
 
 data Simulation = Simulation { _lastIns   :: Maybe Instruction
-                             , _instrs    :: Array Int Instruction
+                             , _instrs    :: Vector Instruction
                              , _instrPtr  :: Int
                              , _cpuSteps  :: Integer
                              , _cpu       :: CPU
@@ -249,10 +248,6 @@ printLogisim file = do
   content <- lines <$> readFile file
   putStrLn . ("v2.0 raw\n" ++) . unlines .
     either pure (map ins2Hex . catMaybes) $ lines2Inss content
-
-(!?) :: (Ix i) => Array i e -> i -> Maybe e
-arr !? i | inRange (bounds arr) i = Just $ arr ! i
-         | otherwise              = Nothing
 
 simulate :: State Simulation [Result]
 simulate = do
@@ -488,7 +483,7 @@ nChar c n s = replicate (n - length s) c ++ s
 defaultSimulation :: Simulation
 defaultSimulation = Simulation
   { _lastIns   = Nothing
-  , _instrs    = array (1,0) []
+  , _instrs    = empty
   , _instrPtr  = 0
   , _cpuSteps  = 0
   , _cpu       = defaultCPU
@@ -507,8 +502,8 @@ runSimulation chs file = do
   either putStrLn (putStr . run . catMaybes) $ lines2Inss content
   where
     run :: [Instruction] -> String
-    run is = prettyResults chs . results . (set instrs ?? defaultSimulation) .
-      listArray (0, length is - 1) $ is
+    run is = prettyResults chs . results . (set instrs ?? defaultSimulation) $
+      fromList is
     results :: Simulation -> [Result]
     results = (:) <$> newSimResult <*> evalState simulate
 
