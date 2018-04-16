@@ -196,45 +196,34 @@ linesToInss =
     where emptyLine l | all isSpace l = Nothing
                       | otherwise     = Just l
 
-regToHex :: RegisterID -> String
-regToHex RegA = "0"
-regToHex RegB = "1"
-regToHex RegC = "2"
-regToHex RegD = "3"
-
-regToInt :: RegisterID -> Int
-regToInt RegA = 0
-regToInt RegB = 1
-regToInt RegC = 2
-regToInt RegD = 3
-
 insToHex :: Instruction -> String
-insToHex (ConstTo r c) = "1" ++ regToHex r ++ nChar '0' 2 (showHex (fromIntegral c) "")
-insToHex (Output r) = "1" ++ showHex (regToInt r + 8) "00"
-insToHex (Jump a) = "20" ++ nChar '0' 2 (showHex (fromIntegral a) "")
-insToHex (JumpIf f a) = "2" ++ flagToHex f ++ nChar '0' 2 (showHex (fromIntegral a) "")
-insToHex (CopyFromRegA r) = "3" ++ showHex (regToInt r) "00"
-insToHex (Alu1 i r) = "4" ++ alu1InsToHex i ++ "0" ++ regToHex r
-insToHex (Alu2 i r) = "8" ++ alu2InsToHex i ++ "0" ++ regToHex r
-insToHex Halt = "0000"
+insToHex = go
+  where
+    go (ConstTo r c) = "1" ++ regToHex r ++ nChar '0' 2 (showHex (fromIntegral c) "")
+    go (Output r) = "1" ++ showHex (fromEnum r + 8) "00"
+    go (Jump a) = "20" ++ nChar '0' 2 (showHex (fromIntegral a) "")
+    go (JumpIf f a) = "2" ++ flagToHex f ++ nChar '0' 2 (showHex (fromIntegral a) "")
+    go (CopyFromRegA r) = "3" ++ showHex (fromEnum r) "00"
+    go (Alu1 i r) = "4" ++ alu1InsToHex i ++ "0" ++ regToHex r
+    go (Alu2 i r) = "8" ++ alu2InsToHex i ++ "0" ++ regToHex r
+    go Halt = "0000"
 
-alu1InsToHex :: Alu1Ins -> String
-alu1InsToHex Negate = nChar '0' 2 "6"
-alu1InsToHex Not    = nChar '0' 2 "7"
+    regToHex = show . fromEnum
 
-alu2InsToHex :: Alu2Ins -> String
-alu2InsToHex Add        = "0"
-alu2InsToHex ShiftLeft  = "1"
-alu2InsToHex ShiftRight = "2"
-alu2InsToHex And        = "3"
-alu2InsToHex Or         = "4"
-alu2InsToHex Xor        = "5"
+    flagToHex Greater = "2"
+    flagToHex Equal   = "1"
+    flagToHex Less    = "3"
+    flagToHex Carry   = "8"
 
-flagToHex :: FlagID -> String
-flagToHex Greater = "2"
-flagToHex Equal   = "1"
-flagToHex Less    = "3"
-flagToHex Carry   = "8"
+    alu1InsToHex Negate = "6"
+    alu1InsToHex Not    = "7"
+
+    alu2InsToHex Add        = "0"
+    alu2InsToHex ShiftLeft  = "1"
+    alu2InsToHex ShiftRight = "2"
+    alu2InsToHex And        = "3"
+    alu2InsToHex Or         = "4"
+    alu2InsToHex Xor        = "5"
 
 appendOriginal :: [String] -> [Maybe Instruction] -> [String]
 appendOriginal ls ms = zipWith ((++) . (++ "    ") . fromMaybe "    ") hexs ls
@@ -476,7 +465,7 @@ prettyResult chs (Result li (map (^.regContent) . listRegisters -> regs) ls step
         lineUni l c r = ansiFg Cyan $ l : replicate 45 c ++ r : "\n"
 
 sign :: Word8 -> Int
-sign = (bool id (subtract 256) =<< (> 127)) .  fromIntegral
+sign = (bool id (subtract 256) =<< (> 127)) . fromIntegral
 
 nChar :: Char -> Int -> String -> String
 nChar c n s = replicate (n - length s) c ++ s

@@ -12,6 +12,7 @@ cta 0xA1
 out a
 ctb 0xF
 add b
+not a
 out a
 
 ;cta 5
