@@ -30,14 +30,6 @@ import Data.Vector (Vector, empty, (!?), fromList)
 -- TODO: print out in binary
 -- TODO: add support for labels
 -- TODO: add linenumbers to instructions
--- TODO: add instruction to negate _flags
--- maybe also just remove Greater and Less, and just allow jumps depending on
--- Equal or Not equal (and carry)
--- TODO: allow reading a register directly into the ALU, changing the cmp
--- _flags.
--- TODO: add a second carry flag for signed operation actually - technically
--- don't need signed one because you can get it from anding with 1000 0000, or
--- something
 
 data FlagStatus = Set | Unset deriving (Eq)
 
@@ -90,6 +82,7 @@ data Instruction = ConstTo RegisterID ConstNum
                  | CopyFromRegA RegisterID
                  | Alu1 Alu1Ins RegisterID
                  | Alu2 Alu2Ins RegisterID
+                 | Nop
                  | Halt
 
 data CPU = CPU { _flags     :: Flags
@@ -182,6 +175,7 @@ strings2Ins [ins, reg] | Just i <- alu = Right . i =<< string2Reg reg
                 ]
         aluLU a as = a <$> lookup ins as
         alu = aluLU Alu1 alu1s <|> aluLU Alu2 alu2s
+strings2Ins ["nop"] = Right Nop
 strings2Ins ["halt"] = Right Halt
 strings2Ins s = Left $ show (unwords s) ++ " is not a valid Instruction"
 
@@ -208,6 +202,7 @@ ins2Hex = go
     go (CopyFromRegA r) = "3" ++ showHex (fromEnum r) "00"
     go (Alu1 i r) = "4" ++ alu1Ins2Hex i ++ "0" ++ reg2Hex r
     go (Alu2 i r) = "8" ++ alu2Ins2Hex i ++ "0" ++ reg2Hex r
+    go Nop = "0001"
     go Halt = "0000"
 
     two0 = nChar '0' 2
@@ -286,10 +281,9 @@ eval (Output r)               = (cpu.output .=) =<< use (cpuReg r.regContent)
 eval (CopyFromRegA r)         = (cpuReg r .=) =<< use (cpuReg RegA)
 eval (Alu1 i r)               = evalAlu1 i r
 eval (Alu2 i r)               = evalAlu2 i r
-eval Halt                     = return ()
-eval (Jump a)                 = zoom instrPtr $ jump a
-eval (JumpIf f a)
-  = (when ?? zoom instrPtr (jump a)) . (== Set) =<< getFlag f
+eval (Jump a)     = zoom instrPtr $ jump a
+eval (JumpIf f a) = (when ?? zoom instrPtr (jump a)) . (== Set) =<< getFlag f
+eval _ = return ()
 
 evalAlu1 :: Alu1Ins -> RegisterID -> State Simulation ()
 evalAlu1 i r = do
@@ -297,15 +291,15 @@ evalAlu1 i r = do
             Negate -> negate
             Not    -> complement
   x <- f <$> use (cpuReg r)
-  cpuReg r .= f x
+  cpuReg r .= x
   zoom (cpu.flags) . putFlags $ compare x 0
 
 evalAlu2 :: Alu2Ins -> RegisterID -> State Simulation ()
 evalAlu2 i r = do
   a <- use (cpuReg RegA)
   x <- use (cpuReg r)
-  let res = fun a x
-      fun = case i of
+  let res = f a x
+      f = case i of
         Add        -> (+)
         ShiftLeft  -> (. fromIntegral) . shiftL
         ShiftRight -> (. fromIntegral) . shiftR
@@ -334,6 +328,7 @@ prettyIns (JumpIf f a)     = "j" ++ prettyFlagID f ++ " " ++ prettyAddress a
 prettyIns (CopyFromRegA r) = "mov " ++ prettyReg r
 prettyIns (Alu1 i r)       = prettyAlu1Ins i ++ " " ++ prettyReg r
 prettyIns (Alu2 i r)       = prettyAlu2Ins i ++ " " ++ prettyReg r
+prettyIns Nop              = "nop"
 prettyIns Halt             = "halt"
 
 prettyAlu1Ins :: Alu1Ins -> String

@@ -15,10 +15,19 @@
 ;not a
 ;out a
 
-cta 5
-mov b
-jmp 1
-ctb 4
-cta 2
-add b
+;cta 5
+;mov b
+;jmp 1
+;ctb 4
+;cta 2
+;add b
+;out a
+
+cta 4
 out a
+not a
+out a
+ctb 5
+out b
+neg b
+out b
