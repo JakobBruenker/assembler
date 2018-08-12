@@ -29,7 +29,6 @@ import System.Environment
 -- TODO: divide into several modules, and split print and simulate into
 -- separate executables
 -- TODO: add support for labels
--- TODO: add TerminationReason to simulate
 
 data FlagStatus = Set | Unset deriving (Eq)
 
@@ -115,6 +114,16 @@ data Result = Result { _resultIns   :: Maybe NumberedInstruction
                      }
 
 makeLenses ''Result
+
+data TerminationReason = Halted
+                       | RanOut
+                       | StepsReached
+
+data Outcome = Outcome { _reason  :: TerminationReason
+                       , _results :: [Result]
+                       }
+
+makeLenses ''Outcome
 
 register :: RegisterID -> Lens' Registers RegContent
 register RegA = regA
@@ -260,22 +269,24 @@ printLogisim binary file = do
   putStrLn . ("v2.0 raw\n" ++) . unlines .
     either pure (map (ins2Hex binary) . catMaybes) $ lines2Inss content
 
-simulate :: Maybe Int -> State Simulation [Result]
+simulate :: Maybe Int -> State Simulation Outcome
 simulate msteps =
-    if | Just True <- (<1) <$> msteps -> return []
-       | otherwise -> do
-         ins <- use instrs
-         ind <- use instrPtr
-         case ins !? ind of
-           Nothing -> return []
-           mni@(Just (view instruction -> i)) -> do
-             cpuSteps += 1
-             instrPtr += 1
-             eval i
-             lastIns .= mni
-             let next = case i of Halt -> return []
-                                  _    -> simulate ((\s -> s - 1) <$> msteps)
-             gets simResult >>= (<$> next) . (:)
+  if | Just True <- (<1) <$> msteps -> end StepsReached
+     | otherwise -> do
+       ins <- use instrs
+       ind <- use instrPtr
+       case ins !? ind of
+         Nothing -> end RanOut
+         mni@(Just (view instruction -> i)) -> do
+           cpuSteps += 1
+           instrPtr += 1
+           eval i
+           lastIns .= mni
+           let next = case i of Halt -> end Halted
+                                _    -> simulate ((\s -> s - 1) <$> msteps)
+           (next <&>) . (results %~) . (:) =<< gets simResult
+  where end :: TerminationReason -> State Simulation Outcome
+        end = pure . (Outcome ?? [])
 
 putFlag :: FlagID -> FlagStatus -> State Flags ()
 putFlag = assign . flag
@@ -301,7 +312,7 @@ eval (Alu1 i r)               = evalAlu1 i r
 eval (Alu2 i r)               = evalAlu2 i r
 eval (Jump a)     = zoom instrPtr $ jump a
 eval (JumpIf f a) = (when ?? zoom instrPtr (jump a)) . (== Set) =<< getFlag f
-eval _ = return ()
+eval _ = pure ()
 
 evalAlu1 :: Alu1Ins -> RegisterID -> State Simulation ()
 evalAlu1 i r = do
@@ -334,7 +345,7 @@ evalAlu2 i r = do
   -- case i of
   --   Add -> zoom (cpu.flags) . putFlag Carry . bool Unset Set $
   --           fromIntegral a + fromIntegral x > 255
-  --   _   -> return ()
+  --   _   -> pure ()
 
 simResult :: Simulation -> Result
 simResult ss = Result { _resultIns   = ss^.lastIns
@@ -389,12 +400,17 @@ prettyConst :: ConstNum -> String
 prettyConst (ConstNum c) =
   "0x" ++ nChar '0' 2 (showHex c " ; ") ++ show c ++ " ; " ++ show (sign c)
 
-prettyResults :: Charset -> [Result] -> String
-prettyResults chs = tblines . concatMap (prettyResult chs)
+prettyResults :: Charset -> Outcome -> String
+prettyResults chs (Outcome tr rs) =
+  (tblines $ concatMap (prettyResult chs) rs) ++ "\n" ++ termReason ++ "\n"
   where tblines s = lineWith '┏' '┓' ++ s ++ lineWith '┗' '┛'
         lineWith l r = case chs of
           ASCII -> ""
           _     -> ansiForeground chs Cyan $ l : replicate 45 '━' ++ r : "\n"
+        termReason = case tr of
+          Halted       -> "Program halted."
+          RanOut       -> "Ran out of instructions."
+          StepsReached -> "Reached maximum number of steps."
 
 ansiAttribute :: Charset -> AnsiAttribute -> String -> String
 ansiAttribute chs attr = ansiNumber chs $ fromEnum attr
@@ -542,10 +558,11 @@ runSimulation msteps chs file = do
   either putStrLn (putStr . run . catMaybes) $ lines2NInss content
   where
     run :: [NumberedInstruction] -> String
-    run is = prettyResults chs . results . (set instrs ?? defaultSimulation) $
+    run is = prettyResults chs . outcome . (set instrs ?? defaultSimulation) $
       fromList is
-    results :: Simulation -> [Result]
-    results = (:) <$> simResult <*> evalState (simulate msteps)
+    outcome :: Simulation -> Outcome
+    outcome =
+      (&) . evalState (simulate msteps) <*> (results %~) . (:) . simResult
 
 boolOption :: String -> Char -> String -> DefineOptions Bool
 boolOption long short desc = defineOption optionType_bool (\o -> o
