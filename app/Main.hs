@@ -12,24 +12,25 @@
 module Main where
 
 import Control.Applicative ((<|>))
+import Control.Lens
 import Control.Monad.State
 import Data.Bits
 import Data.Bool
-import Data.Maybe
 import Data.Char
-import Data.List
 import Data.Either
-import System.Environment
+import Data.List
+import Data.Maybe
+import Data.Vector (Vector, empty, (!?), fromList)
 import Data.Word
 import Numeric
-import Control.Lens
-import Data.Vector (Vector, empty, (!?), fromList)
+import Options
+import System.Environment
 
--- TODO: divide into several modules
--- TODO: allow to run only up to a certain number of steps
+-- TODO: divide into several modules, and split print and simulate into
+-- separate executables
 -- TODO: print out in binary
 -- TODO: add support for labels
--- TODO: add linenumbers to instructions
+-- TODO: add linenumbers to instructions in results
 
 data FlagStatus = Set | Unset deriving (Eq)
 
@@ -110,12 +111,12 @@ data Result = Result { _resultIns   :: Maybe Instruction
 
 makeLenses ''Result
 
-data Option = Option { _switch :: Char
-                     , _desc   :: String
-                     , _action :: String -> IO ()
-                     }
+-- data Option = Option { _switch :: Char
+--                      , _desc   :: String
+--                      , _action :: String -> IO ()
+--                      }
 
-makeLenses ''Option
+-- makeLenses ''Option
 
 register :: RegisterID -> Lens' Registers RegContent
 register RegA = regA
@@ -247,20 +248,22 @@ printLogisim file = do
   putStrLn . ("v2.0 raw\n" ++) . unlines .
     either pure (map ins2Hex . catMaybes) $ lines2Inss content
 
-simulate :: State Simulation [Result]
-simulate = do
-    ins <- use instrs
-    ind <- use instrPtr
-    case ins !? ind of
-      Nothing -> return []
-      Just i  -> do
-        cpuSteps += 1
-        instrPtr += 1
-        eval i
-        lastIns .= Just i
-        let next = case i of Halt -> return []
-                             _    -> simulate
-        gets simResult >>= (<$> next) . (:)
+simulate :: Maybe Int -> State Simulation [Result]
+simulate msteps =
+    if | Just True <- (<1) <$> msteps -> return []
+       | otherwise -> do
+         ins <- use instrs
+         ind <- use instrPtr
+         case ins !? ind of
+           Nothing -> return []
+           Just i  -> do
+             cpuSteps += 1
+             instrPtr += 1
+             eval i
+             lastIns .= Just i
+             let next = case i of Halt -> return []
+                                  _    -> simulate ((\s -> s - 1) <$> msteps)
+             gets simResult >>= (<$> next) . (:)
 
 putFlag :: FlagID -> FlagStatus -> State Flags ()
 putFlag = assign . flag
@@ -517,8 +520,8 @@ defaultCPU = CPU
   , _output    = 0
   }
 
-runSimulation :: Charset -> String -> IO ()
-runSimulation chs file = do
+runSimulation :: Maybe Int -> Charset -> String -> IO ()
+runSimulation msteps chs file = do
   content <- lines <$> readFile file
   either putStrLn (putStr . run . catMaybes) $ lines2Inss content
   where
@@ -526,34 +529,76 @@ runSimulation chs file = do
     run is = prettyResults chs . results . (set instrs ?? defaultSimulation) $
       fromList is
     results :: Simulation -> [Result]
-    results = (:) <$> simResult <*> evalState simulate
+    results = (:) <$> simResult <*> evalState (simulate msteps)
+
+boolOption :: String -> Char -> String -> DefineOptions Bool
+boolOption long short desc = defineOption optionType_bool (\o -> o
+  { optionLongFlags   = [long]
+  , optionShortFlags  = [short]
+  , optionDescription = desc
+  , optionDefault     = False
+  })
+
+data MainOptions = MainOptions
+
+instance Options MainOptions where
+  defineOptions = pure MainOptions
+
+data PrintOptions = PrintOptions
+  { optLogisim  :: Bool
+  , optAssembly :: Bool
+  }
+
+instance Options PrintOptions where
+  defineOptions = pure PrintOptions
+    <*> boolOption "logisim" 'l'
+        "Whether to print out in Logisim ROM format"
+    <*> boolOption "assembly" 'a'
+        "Whether to print out the assembly code, when --logisim is off"
+
+data SimulateOptions = SimulateOptions
+  { optUnicode :: Bool
+  , optColor   :: Bool
+  , optSteps   :: Maybe Int
+  }
+
+instance Options SimulateOptions where
+  defineOptions = pure SimulateOptions
+    <*> boolOption "unicode" 'u'
+        "Whether to use unicode"
+    <*> boolOption "color" 'c'
+        "Whether to use ANSI color escape sequences, when --unicode is on"
+    <*> defineOption (optionType_maybe optionType_int) (\o -> o
+          { optionLongFlags   = ["steps"]
+          , optionShortFlags  = ['s']
+          , optionDescription = "Maximum number of simulated steps"
+          , optionDefault     = Nothing
+          })
+
+checkFilename :: (String -> IO ()) -> [String] -> IO ()
+checkFilename f [filename] = f filename
+checkFilename _ _ = putStrLn . usage =<< getProgName
+
+runPrint :: MainOptions -> PrintOptions -> [String] -> IO ()
+runPrint _ opts args = checkFilename go args
+  where go | optLogisim  opts = printLogisim
+           | optAssembly opts = printHexAndOrig
+           | otherwise        = printHex
+
+runSimulate :: MainOptions -> SimulateOptions -> [String] -> IO ()
+runSimulate _ opts args = checkFilename go args
+  where go | optUnicode opts, optColor opts = runSim ANSI
+           | optUnicode opts                = runSim Unicode
+           | otherwise                      = runSim ASCII
+        runSim = runSimulation $ optSteps opts
 
 main :: IO ()
-main = getArgs >>= \case
-  [['-', s], file] | Just o <- findSwitch s -> o^.action $ file
-  _ -> putStrLn . usage =<< getProgName
-  where findSwitch s = find ((s ==) . view switch) options
+main = runSubcommand
+  [ subcommand "print" runPrint
+  , subcommand "simulate" runSimulate
+  ]
 
 usage :: String -> String
 usage progName =
-  "Usage: " ++ progName ++ " -(" ++ switches ++ ") FILE\n" ++ optionDescs
-  where
-    switches = intersperse '|' $ map (^.switch) options
-    optionDescs = unlines $
-      map ((++) <$> ("  -" ++) . (:": ") . (^.switch) <*> (^.desc)) options
-
-options :: [Option]
-options = map (\(a,b,c) -> Option a b c)
-  [ ( 'p', "print both hexadecimal and the original assembly"
-    , printHexAndOrig)
-  , ( 'h', "print only hexadecimal"
-    , printHex)
-  , ( 'l', "print in Logisim ROM format"
-    , printLogisim)
-  , ( 'a', "simulate the CPU (ASCII output)"
-    , runSimulation ASCII)
-  , ( 'u', "simulate the CPU (Unicode output)"
-    , runSimulation Unicode)
-  , ( 'n', "simulate the CPU (Unicode output using ANSI Escape Sequences)"
-    , runSimulation ANSI)
-  ]
+  "Usage: " ++ progName ++ " {print|simulate} [<OPTIONS>] <FILE>\n" ++
+  "For available options, see\n" ++ progName ++ " {print|simulate} --help"
