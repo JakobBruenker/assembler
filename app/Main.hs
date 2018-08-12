@@ -28,7 +28,6 @@ import System.Environment
 
 -- TODO: divide into several modules, and split print and simulate into
 -- separate executables
--- TODO: print out in binary
 -- TODO: add support for labels
 -- TODO: add linenumbers to instructions in results
 
@@ -196,8 +195,8 @@ lines2Inss =
     where emptyLine l | all isSpace l = Nothing
                       | otherwise     = Just l
 
-ins2Hex :: Instruction -> String
-ins2Hex = go
+ins2Hex :: Bool -> Instruction -> String
+ins2Hex binary = (if binary then hexToBin else id) . go
   where
     go (ConstTo r c) = "1" ++ reg2Hex r ++ two0 (showHex (fromIntegral c) "")
     go (Output r) = "1" ++ showHex (fromEnum r + 8) "00"
@@ -228,25 +227,35 @@ ins2Hex = go
     alu2Ins2Hex Or         = "4"
     alu2Ins2Hex Xor        = "5"
 
-appendOriginal :: [String] -> [Maybe Instruction] -> [String]
-appendOriginal ls ms = zipWith ((++) . (++ "    ") . fromMaybe "    ") hexs ls
-  where hexs = map (fmap ins2Hex) ms
+-- Careful: prints out an error if the input isn't actually hex
+hexToBin :: String -> String
+hexToBin s = case readInt 16 isHexDigit digitToInt s of
+  [(n, "")] -> let s' = showIntAtBase 2 intToDigit n ""
+               in replicate (4 * length s - length s') '0' ++ s'
+  _ -> error $ "Main.hextoBin: tried to read " ++ show s ++ " as a hex number"
 
-printHexAndOrig :: String -> IO ()
-printHexAndOrig file = do
+appendOriginal :: Bool -> [String] -> [Maybe Instruction] -> [String]
+appendOriginal binary ls ms =
+  zipWith ((++) . (++ "    ") . fromMaybe "    ") hexs ls
+  where hexs = map (fmap (ins2Hex binary)) ms
+
+printAsmAndOrig :: Bool -> String -> IO ()
+printAsmAndOrig binary file = do
   content <- lines <$> readFile file
-  mapM_ putStrLn . either pure (appendOriginal content) $ lines2Inss content
+  mapM_ putStrLn . either pure (appendOriginal binary content) $
+    lines2Inss content
 
-printHex :: String -> IO ()
-printHex file = do
+printAsm :: Bool -> String -> IO ()
+printAsm binary file = do
   content <- lines <$> readFile file
-  mapM_ putStrLn . either pure (map ins2Hex . catMaybes) $ lines2Inss content
+  mapM_ putStrLn . either pure (map (ins2Hex binary) . catMaybes) $
+    lines2Inss content
 
-printLogisim :: String -> IO ()
-printLogisim file = do
+printLogisim :: Bool -> String -> IO ()
+printLogisim binary file = do
   content <- lines <$> readFile file
   putStrLn . ("v2.0 raw\n" ++) . unlines .
-    either pure (map ins2Hex . catMaybes) $ lines2Inss content
+    either pure (map (ins2Hex binary) . catMaybes) $ lines2Inss content
 
 simulate :: Maybe Int -> State Simulation [Result]
 simulate msteps =
@@ -547,6 +556,7 @@ instance Options MainOptions where
 data PrintOptions = PrintOptions
   { optLogisim  :: Bool
   , optAssembly :: Bool
+  , optBinary :: Bool
   }
 
 instance Options PrintOptions where
@@ -555,6 +565,8 @@ instance Options PrintOptions where
         "Whether to print out in Logisim ROM format"
     <*> boolOption "assembly" 'a'
         "Whether to print out the assembly code, when --logisim is off"
+    <*> boolOption "binary" 'b'
+        "Whether to print in binary, when --logisim is off"
 
 data SimulateOptions = SimulateOptions
   { optUnicode :: Bool
@@ -581,9 +593,10 @@ checkFilename _ _ = putStrLn . usage =<< getProgName
 
 runPrint :: MainOptions -> PrintOptions -> [String] -> IO ()
 runPrint _ opts args = checkFilename go args
-  where go | optLogisim  opts = printLogisim
-           | optAssembly opts = printHexAndOrig
-           | otherwise        = printHex
+  where go | optLogisim  opts = printLogisim binary
+           | optAssembly opts = printAsmAndOrig binary
+           | otherwise        = printAsm binary
+        binary = optBinary opts
 
 runSimulate :: MainOptions -> SimulateOptions -> [String] -> IO ()
 runSimulate _ opts args = checkFilename go args
