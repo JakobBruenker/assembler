@@ -29,6 +29,7 @@ import System.Environment
 -- TODO: divide into several modules, and split print and simulate into
 -- separate executables
 -- TODO: add support for labels
+-- TODO: add TerminationReason to simulate
 
 data FlagStatus = Set | Unset deriving (Eq)
 
@@ -84,6 +85,12 @@ data Instruction = ConstTo RegisterID ConstNum
                  | Nop
                  | Halt
 
+data NumberedInstruction = NIns { _linenumber :: Int
+                                , _instruction :: Instruction
+                                }
+
+makeLenses ''NumberedInstruction
+
 data CPU = CPU { _flags     :: Flags
                , _registers :: Registers
                , _output    :: Word8
@@ -91,8 +98,8 @@ data CPU = CPU { _flags     :: Flags
 
 makeLenses ''CPU
 
-data Simulation = Simulation { _lastIns   :: Maybe (Int, Instruction) --w/line
-                             , _instrs    :: Vector Instruction
+data Simulation = Simulation { _lastIns   :: Maybe NumberedInstruction
+                             , _instrs    :: Vector NumberedInstruction
                              , _instrPtr  :: Int
                              , _cpuSteps  :: Integer
                              , _cpu       :: CPU
@@ -100,7 +107,7 @@ data Simulation = Simulation { _lastIns   :: Maybe (Int, Instruction) --w/line
 
 makeLenses ''Simulation
 
-data Result = Result { _resultIns   :: Maybe (Int, Instruction) --w/linenumber
+data Result = Result { _resultIns   :: Maybe NumberedInstruction
                      , _resultRegs  :: Registers
                      , _leds        :: Word8
                      , _resultFlags :: Flags
@@ -182,8 +189,12 @@ string2Reg "d" = Right RegD
 string2Reg s = Left $ "No register named " ++ show s
 
 lines2Inss :: [String] -> Either String [Maybe Instruction]
-lines2Inss =
-  mapM (traverse (strings2Ins . words) . emptyLine . takeWhile (/= ';'))
+lines2Inss = (fmap . fmap . fmap . fmap) (view instruction) lines2NInss
+-- Just look at this beast ^
+
+lines2NInss :: [String] -> Either String [Maybe NumberedInstruction]
+lines2NInss = zipWithM (\lnu -> ((fmap . fmap) (NIns lnu)) .
+    (traverse (strings2Ins . words) . emptyLine . takeWhile (/= ';'))) [1..]
     where emptyLine l | all isSpace l = Nothing
                       | otherwise     = Just l
 
@@ -257,11 +268,11 @@ simulate msteps =
          ind <- use instrPtr
          case ins !? ind of
            Nothing -> return []
-           Just i  -> do
+           mni@(Just (view instruction -> i)) -> do
              cpuSteps += 1
              instrPtr += 1
              eval i
-             lastIns .= Just (ind, i)
+             lastIns .= mni
              let next = case i of Halt -> return []
                                   _    -> simulate ((\s -> s - 1) <$> msteps)
              gets simResult >>= (<$> next) . (:)
@@ -318,6 +329,7 @@ evalAlu2 i r = do
   zoom (cpu.flags) $ do putFlags $ compare res 0
                         putFlag Carry . bool Unset Set $
                           fromIntegral a + fromIntegral x > 255
+  -- TODO:
   -- Question: should carry flag only be set if the operation is Add?
   -- case i of
   --   Add -> zoom (cpu.flags) . putFlag Carry . bool Unset Set $
@@ -326,14 +338,14 @@ evalAlu2 i r = do
 
 simResult :: Simulation -> Result
 simResult ss = Result { _resultIns   = ss^.lastIns
-                         , _resultRegs  = ss^.cpu.registers
-                         , _leds        = ss^.cpu.output
-                         , _resultFlags = ss^.cpu.flags
-                         , _resultSteps = ss^.cpuSteps
-                         }
+                      , _resultRegs  = ss^.cpu.registers
+                      , _leds        = ss^.cpu.output
+                      , _resultFlags = ss^.cpu.flags
+                      , _resultSteps = ss^.cpuSteps
+                      }
 
-prettyLastIns :: Int -> Instruction -> String
-prettyLastIns ln = ((show ln ++ ": ") ++) . prettyIns
+prettyNIns :: NumberedInstruction -> String
+prettyNIns (NIns ln ins) = (show ln ++ ": ") ++ prettyIns ins
 
 prettyIns :: Instruction -> String
 prettyIns (ConstTo r c)    = "ct" ++ prettyReg r ++ " " ++ prettyConst c
@@ -417,7 +429,7 @@ prettyResult
     -- using nChar here makes this a bit confusing to be honest
     spaces = (asciiUni "       " "" ++) .
       nChar ' ' (43 - length lastI' + maybe 1 (const 2) li * length (bw ""))
-    lastI' = maybe "" (ansiFg Red . ansiAttr Bold . uncurry prettyLastIns) li
+    lastI' = maybe "" (ansiFg Red . ansiAttr Bold . prettyNIns) li
     dispSteps = ansiFg Magenta . ansiAttr Bold $ show steps
     regLine isTop =
       br 1 . bl $ intercalate sepDist (replicate 4 $ oneReg isTop)
@@ -527,9 +539,9 @@ defaultCPU = CPU
 runSimulation :: Maybe Int -> Charset -> String -> IO ()
 runSimulation msteps chs file = do
   content <- lines <$> readFile file
-  either putStrLn (putStr . run . catMaybes) $ lines2Inss content
+  either putStrLn (putStr . run . catMaybes) $ lines2NInss content
   where
-    run :: [Instruction] -> String
+    run :: [NumberedInstruction] -> String
     run is = prettyResults chs . results . (set instrs ?? defaultSimulation) $
       fromList is
     results :: Simulation -> [Result]
