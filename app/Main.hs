@@ -104,6 +104,7 @@ makeLenses ''Simulation
 data Result = Result { _resultIns   :: Maybe Instruction
                      , _resultRegs  :: Registers
                      , _leds        :: Word8
+                     , _resultFlags :: Flags
                      , _resultSteps :: Integer
                      }
 
@@ -160,7 +161,7 @@ strings2Ins ['j' : cs, a] | Just j <- jmp = Right . j =<< readA
                     | otherwise            -> Left $ a ++
                       " is outside the valid address range of -128..127"
           _ -> Left $ show a ++ " is not a valid address"
-strings2Ins [ins, reg] | elem ins ["mov", "cpy"] =
+strings2Ins [ins, reg] | ins `elem` ["mov", "cpy"] =
   Right . CopyFromRegA =<< string2Reg reg
 strings2Ins [ins, reg] | Just i <- alu = Right . i =<< string2Reg reg
   where alu1s = [ ("neg", Negate)
@@ -173,6 +174,8 @@ strings2Ins [ins, reg] | Just i <- alu = Right . i =<< string2Reg reg
                 , ("or" , Or )
                 , ("xor", Xor)
                 ]
+        aluLU :: (a -> RegisterID -> Instruction) -> [(String, a)]
+              -> Maybe (RegisterID -> Instruction)
         aluLU a as = a <$> lookup ins as
         alu = aluLU Alu1 alu1s <|> aluLU Alu2 alu2s
 strings2Ins ["nop"] = Right Nop
@@ -202,7 +205,7 @@ ins2Hex = go
     go (CopyFromRegA r) = "3" ++ showHex (fromEnum r) "00"
     go (Alu1 i r) = "4" ++ alu1Ins2Hex i ++ "0" ++ reg2Hex r
     go (Alu2 i r) = "8" ++ alu2Ins2Hex i ++ "0" ++ reg2Hex r
-    go Nop = "0001"
+    go Nop = "0100"
     go Halt = "0000"
 
     two0 = nChar '0' 2
@@ -257,7 +260,7 @@ simulate = do
         lastIns .= Just i
         let next = case i of Halt -> return []
                              _    -> simulate
-        gets newSimResult >>= (<$> next) . (:)
+        gets simResult >>= (<$> next) . (:)
 
 putFlag :: FlagID -> FlagStatus -> State Flags ()
 putFlag = assign . flag
@@ -290,9 +293,10 @@ evalAlu1 i r = do
   let f = case i of
             Negate -> negate
             Not    -> complement
-  x <- f <$> use (cpuReg r)
-  cpuReg r .= x
-  zoom (cpu.flags) . putFlags $ compare x 0
+  res <- f <$> use (cpuReg r)
+  cpuReg r .= res
+  zoom (cpu.flags) $ do putFlags $ compare res 0
+                        putFlag Carry Unset
 
 evalAlu2 :: Alu2Ins -> RegisterID -> State Simulation ()
 evalAlu2 i r = do
@@ -307,16 +311,20 @@ evalAlu2 i r = do
         Or         -> (.|.)
         Xor        -> xor
   cpuReg RegA .= res
-  zoom (cpu.flags) . putFlags $ compare res 0
-  case i of
-    Add -> zoom (cpu.flags) . putFlag Carry . bool Unset Set $
-            fromIntegral a + fromIntegral x > 255
-    _   -> return ()
+  zoom (cpu.flags) $ do putFlags $ compare res 0
+                        putFlag Carry . bool Unset Set $
+                          fromIntegral a + fromIntegral x > 255
+  -- Question: should carry flag only be set if the operation is Add?
+  -- case i of
+  --   Add -> zoom (cpu.flags) . putFlag Carry . bool Unset Set $
+  --           fromIntegral a + fromIntegral x > 255
+  --   _   -> return ()
 
-newSimResult :: Simulation -> Result
-newSimResult ss = Result { _resultIns   = ss^.lastIns
+simResult :: Simulation -> Result
+simResult ss = Result { _resultIns   = ss^.lastIns
                          , _resultRegs  = ss^.cpu.registers
                          , _leds        = ss^.cpu.output
+                         , _resultFlags = ss^.cpu.flags
                          , _resultSteps = ss^.cpuSteps
                          }
 
@@ -387,7 +395,7 @@ ansiCustom chs fmt s = case chs of
 -- I think it definitely makes sense to put Unicode and ANSI together)
 prettyResult :: Charset -> Result -> String
 prettyResult
-  chs (Result li (map (^.regContent) . listRegisters -> regs) ls steps) =
+  chs (Result li (map (^.regContent) . listRegisters -> regs) ls fs steps) =
   line False ++
   lastI ++
   line True ++
@@ -432,19 +440,37 @@ prettyResult
     sepDist = case chs of ASCII -> "  "; _ -> " "
     diodes = asciiUni diodesASCII diodesUni
       where
-        diodesASCII = "  " ++ lights ++ "   hex: " ++ hex ++
+        diodesASCII = prettyFlags ++ " " ++ lights ++ "   hex: " ++ hex ++
           "   udec: " ++ udec ++ "   sdec: " ++ sdec ++ "\n"
-        diodesUni = diodeLine '┏' '┯' '┓' ++ (br 6 . bl)
-          (yl "     ┃ " ++ lights ++ yl " │ " ++ hex ++
-          yl " │ " ++ udec ++ yl " │ " ++ sdec ++ yl " ┃") ++
+        diodesUni = diodeLine '┏' '┯' '┓' ++ (br 2 . bl)
+          (yl " ┃ " ++ prettyFlags ++ yl " │ " ++ lights ++ yl " │ " ++
+          hex ++ yl " │  " ++ udec ++ yl " │ " ++ sdec ++ yl " ┃") ++
           diodeLine '┗' '┷' '┛'
+        prettyFlags = case chs of
+          ASCII | length flagStates < 4 -> "E E"
+                | otherwise -> (case last flagStates of Set -> "C"
+                                                        _   -> " ") ++
+                               case take 3 flagStates of
+                                 [Set,   Unset, Unset] -> " >"
+                                 [Unset, Set,   Unset] -> " ="
+                                 [Unset, Unset, Set  ] -> " <"
+                                 [Set  , Set  , Unset] -> "<="
+                                 [Unset, Set  , Set  ] -> ">="
+                                 [Unset, Unset, Unset] -> "  "
+                                 _                     -> " E"
+          _ -> concat $
+            zipWith (\f c -> (ansiFg $ case f of
+                      Set -> White
+                      _   -> Black) [c])
+                    flagStates "GELC"
+          where flagStates = map ((fs^.) . flag) [Greater ..]
         lights = insertSpace (map applyEnc $
           nChar '0' 8 $ showIntAtBase 2 ("01" !!) ls "")
         hex = "0x" ++ bw (nChar '0' 2 $ showHex ls "")
         udec = wt . nChar ' ' 3 $ show ls
         sdec = wt . nChar ' ' 4 . show $ sign ls
-        diodeLine l c r = br 6 . bl . yl . ("     " ++) . (l :) .
-          (++ [r]) . intercalate [c] $ map (`replicate` '━') [11,6,5,6]
+        diodeLine l c r = br 2 . bl . yl . (" " ++) . (l :) .
+          (++ [r]) . intercalate [c] $ map (`replicate` '━') [6,11,6,6,6]
         applyEnc l | l == '0' = case chs of
                      ASCII   -> "O"
                      Unicode -> "○"
@@ -500,7 +526,7 @@ runSimulation chs file = do
     run is = prettyResults chs . results . (set instrs ?? defaultSimulation) $
       fromList is
     results :: Simulation -> [Result]
-    results = (:) <$> newSimResult <*> evalState simulate
+    results = (:) <$> simResult <*> evalState simulate
 
 main :: IO ()
 main = getArgs >>= \case
