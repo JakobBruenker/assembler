@@ -29,7 +29,6 @@ import System.Environment
 -- TODO: divide into several modules, and split print and simulate into
 -- separate executables
 -- TODO: add support for labels
--- TODO: add linenumbers to instructions in results
 
 data FlagStatus = Set | Unset deriving (Eq)
 
@@ -92,7 +91,7 @@ data CPU = CPU { _flags     :: Flags
 
 makeLenses ''CPU
 
-data Simulation = Simulation { _lastIns   :: Maybe Instruction
+data Simulation = Simulation { _lastIns   :: Maybe (Int, Instruction) --w/line
                              , _instrs    :: Vector Instruction
                              , _instrPtr  :: Int
                              , _cpuSteps  :: Integer
@@ -101,7 +100,7 @@ data Simulation = Simulation { _lastIns   :: Maybe Instruction
 
 makeLenses ''Simulation
 
-data Result = Result { _resultIns   :: Maybe Instruction
+data Result = Result { _resultIns   :: Maybe (Int, Instruction) --w/linenumber
                      , _resultRegs  :: Registers
                      , _leds        :: Word8
                      , _resultFlags :: Flags
@@ -109,13 +108,6 @@ data Result = Result { _resultIns   :: Maybe Instruction
                      }
 
 makeLenses ''Result
-
--- data Option = Option { _switch :: Char
---                      , _desc   :: String
---                      , _action :: String -> IO ()
---                      }
-
--- makeLenses ''Option
 
 register :: RegisterID -> Lens' Registers RegContent
 register RegA = regA
@@ -269,7 +261,7 @@ simulate msteps =
              cpuSteps += 1
              instrPtr += 1
              eval i
-             lastIns .= Just i
+             lastIns .= Just (ind, i)
              let next = case i of Halt -> return []
                                   _    -> simulate ((\s -> s - 1) <$> msteps)
              gets simResult >>= (<$> next) . (:)
@@ -339,6 +331,9 @@ simResult ss = Result { _resultIns   = ss^.lastIns
                          , _resultFlags = ss^.cpu.flags
                          , _resultSteps = ss^.cpuSteps
                          }
+
+prettyLastIns :: Int -> Instruction -> String
+prettyLastIns ln = ((show ln ++ ": ") ++) . prettyIns
 
 prettyIns :: Instruction -> String
 prettyIns (ConstTo r c)    = "ct" ++ prettyReg r ++ " " ++ prettyConst c
@@ -422,7 +417,7 @@ prettyResult
     -- using nChar here makes this a bit confusing to be honest
     spaces = (asciiUni "       " "" ++) .
       nChar ' ' (43 - length lastI' + maybe 1 (const 2) li * length (bw ""))
-    lastI' = maybe "" (ansiFg Red . ansiAttr Bold . prettyIns) li
+    lastI' = maybe "" (ansiFg Red . ansiAttr Bold . uncurry prettyLastIns) li
     dispSteps = ansiFg Magenta . ansiAttr Bold $ show steps
     regLine isTop =
       br 1 . bl $ intercalate sepDist (replicate 4 $ oneReg isTop)
