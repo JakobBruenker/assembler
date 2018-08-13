@@ -15,7 +15,6 @@
 module Main where
 
 import Control.Applicative ((<|>))
-import Data.Bifunctor
 import Control.Lens
 import Control.Monad.State
 import Data.Bits
@@ -33,11 +32,11 @@ import System.Environment
 
 -- TODO: divide into several modules, and split print and simulate into
 -- separate executables
--- TODO: add support for labels
--- TODO: add line numbers to errors
 -- TODO: add instructions to negate flags
 -- TODO: maybe add jge, jle, and jnz, to be translated into negating flags and
 -- the opposite jump
+-- TODO: add labels to jump instructions so they can be displayed during
+-- simulation
 
 data FlagStatus = Set | Unset deriving (Show, Eq)
 
@@ -193,7 +192,7 @@ strings2Ins labels (i, Numbered l ['j' : cs, a]) | Just j <- jmp =
         toAddr :: Int -> Maybe String -> Either String Address
         toAddr addr ms
           | addr < 128 && addr >= -128 = Right $ Address (fromIntegral addr)
-          | otherwise                  = Left $ fromMaybe (show addr) ms ++
+          | otherwise = mkError l $ fromMaybe (show addr) ms ++
             " is outside the valid address range of -128..127"
 strings2Ins _ (_, Numbered l [ins, reg]) | ins `elem` ["mov", "cpy"] =
   Numbered l <$> (Right . CopyFromRegA =<< string2Reg l reg)
@@ -247,8 +246,9 @@ getInsLines ss = (,fmap (uncurry Numbered) <$> ins) <$>
 
     assignLbls :: [(Int, String)] -> [(Int, (Int, String))] -> Labels
            -> Either String Labels
-    assignLbls lbl@((n, l):ls) is@((_, (m, _)):is'@((x, (o, _)):_)) lblm
-      | m < n, n <= o = assignLbls ls is =<< insertLabel n l x lblm
+    assignLbls lbl@((n, l):ls) is@((x, (m, _)):is'@((y, (o, _)):_)) lblm
+      | n < m = assignLbls ls is =<< insertLabel n l x lblm
+      | m < n, n <= o = assignLbls ls is =<< insertLabel n l y lblm
       | otherwise = assignLbls lbl is' lblm
     assignLbls lbl@((n, l):ls) is@[(x, (o, _))] lblm
       | n <= o = assignLbls ls is =<< insertLabel n l x lblm
