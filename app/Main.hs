@@ -35,8 +35,6 @@ import System.Environment
 -- TODO: add instructions to negate flags
 -- TODO: maybe add jge, jle, and jnz, to be translated into negating flags and
 -- the opposite jump
--- TODO: add labels to jump instructions so they can be displayed during
--- simulation
 
 data FlagStatus = Set | Unset deriving (Show, Eq)
 
@@ -86,8 +84,8 @@ data Alu2Ins = Add | ShiftLeft | ShiftRight | And | Or | Xor deriving Show
 
 data Instruction = ConstTo RegisterID ConstNum
                  | Output RegisterID
-                 | Jump Address
-                 | JumpIf FlagID Address
+                 | Jump Address (Maybe String)
+                 | JumpIf FlagID Address (Maybe String)
                  | CopyFromRegA RegisterID
                  | Alu1 Alu1Ins RegisterID
                  | Alu2 Alu2Ins RegisterID
@@ -175,7 +173,7 @@ strings2Ins _ (_, Numbered l [['c', 't', r], c]) | not $ null reg =
 strings2Ins _ (_, Numbered l ["out", reg]) = Numbered l <$>
   (Right . Output =<< string2Reg l reg)
 strings2Ins labels (i, Numbered l ['j' : cs, a]) | Just j <- jmp =
-  Numbered l <$> (Right . j =<< readA)
+  Numbered l <$> (Right . uncurry j =<< readA)
   where jmp | cs == "mp" = Just Jump
             | otherwise  = lookup cs jumpIfs
         jumpIfs = [ ("e", JumpIf Equal)
@@ -184,14 +182,17 @@ strings2Ins labels (i, Numbered l ['j' : cs, a]) | Just j <- jmp =
                   , ("l", JumpIf Less)
                   , ("c", JumpIf Carry)
                   ]
+        readA :: Either String (Address, Maybe String)
         readA = case reads a of
           [(x, "")] -> toAddr x Nothing
           _ | Just addr <- M.lookup a labels ->
-              Right . Address . fromIntegral $ addr - i
+              -- Right . Address . fromIntegral $ addr - i
+              toAddr (addr - i) $ Just a
           _ -> mkError l $ show a ++ " is not a valid address or label"
-        toAddr :: Int -> Maybe String -> Either String Address
+        toAddr :: Int -> Maybe String -> Either String (Address, Maybe String)
         toAddr addr ms
-          | addr < 128 && addr >= -128 = Right $ Address (fromIntegral addr)
+          | addr < 128 && addr >= -128 =
+            Right $ (Address (fromIntegral addr), ms)
           | otherwise = mkError l $ fromMaybe (show addr) ms ++
             " is outside the valid address range of -128..127"
 strings2Ins _ (_, Numbered l [ins, reg]) | ins `elem` ["mov", "cpy"] =
@@ -278,8 +279,9 @@ ins2Hex binary = (if binary then unsafeHexToBin else id) . go
   where
     go (ConstTo r c) = "1" ++ reg2Hex r ++ two0 (showHex (fromIntegral c) "")
     go (Output r) = "1" ++ showHex (fromEnum r + 8) "00"
-    go (Jump a) = "20" ++ two0 (showHex (fromIntegral a) "")
-    go (JumpIf f a) = "2" ++ flag2Hex f ++ two0 (showHex (fromIntegral a) "")
+    go (Jump a _) = "20" ++ two0 (showHex (fromIntegral a) "")
+    go (JumpIf f a _) =
+      "2" ++ flag2Hex f ++ two0 (showHex (fromIntegral a) "")
     go (CopyFromRegA r) = "3" ++ showHex (fromEnum r) "00"
     go (Alu1 i r) = "4" ++ alu1Ins2Hex i ++ "0" ++ reg2Hex r
     go (Alu2 i r) = "8" ++ alu2Ins2Hex i ++ "0" ++ reg2Hex r
@@ -397,8 +399,9 @@ eval (Output r)               = (cpu.output .=) =<< use (cpuReg r.regContent)
 eval (CopyFromRegA r)         = (cpuReg r .=) =<< use (cpuReg RegA)
 eval (Alu1 i r)               = evalAlu1 i r
 eval (Alu2 i r)               = evalAlu2 i r
-eval (Jump a)     = zoom instrPtr $ jump a
-eval (JumpIf f a) = (when ?? zoom instrPtr (jump a)) . (== Set) =<< getFlag f
+eval (Jump a _)               = zoom instrPtr $ jump a
+eval (JumpIf f a _)
+  = (when ?? zoom instrPtr (jump a)) . (== Set) =<< getFlag f
 eval _ = pure ()
 
 evalAlu1 :: Alu1Ins -> RegisterID -> State Simulation ()
@@ -448,13 +451,18 @@ prettyNIns (Numbered ln ins) = (show ln ++ ": ") ++ prettyIns ins
 prettyIns :: Instruction -> String
 prettyIns (ConstTo r c)    = "ct" ++ prettyReg r ++ " " ++ prettyConst c
 prettyIns (Output r)       = "out " ++ prettyReg r
-prettyIns (Jump a)         = "jmp " ++ prettyAddress a
-prettyIns (JumpIf f a)     = "j" ++ prettyFlagID f ++ " " ++ prettyAddress a
 prettyIns (CopyFromRegA r) = "mov " ++ prettyReg r
 prettyIns (Alu1 i r)       = prettyAlu1Ins i ++ " " ++ prettyReg r
 prettyIns (Alu2 i r)       = prettyAlu2Ins i ++ " " ++ prettyReg r
 prettyIns Nop              = "nop"
 prettyIns Halt             = "halt"
+prettyIns (Jump a l)       = "jmp " ++ prettyAddress a ++ prettyLabel l
+prettyIns (JumpIf f a l)   =
+  "j" ++ prettyFlagID f ++ " " ++ prettyAddress a ++ prettyLabel l
+
+prettyLabel :: Maybe String -> String
+prettyLabel (Just l) = "; " ++ l
+prettyLabel Nothing = ""
 
 prettyAlu1Ins :: Alu1Ins -> String
 prettyAlu1Ins Negate = "neg"
