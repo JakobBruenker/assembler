@@ -9,10 +9,13 @@ out a
 ; main loop
 mov c
 add b
+jc 8
 out d
 out a
 mov b
 add c
 out d
 out a
-jmp -8
+jmp -9
+halt
+ ;test

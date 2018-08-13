@@ -8,10 +8,14 @@
 {-# LANGUAGE TemplateHaskell            #-}
 {-# LANGUAGE FlexibleContexts           #-}
 {-# LANGUAGE Rank2Types                 #-}
+{-# LANGUAGE DeriveFunctor              #-}
+{-# LANGUAGE DeriveFoldable             #-}
+{-# LANGUAGE DeriveTraversable          #-}
 
 module Main where
 
 import Control.Applicative ((<|>))
+import Data.Bifunctor
 import Control.Lens
 import Control.Monad.State
 import Data.Bits
@@ -20,6 +24,7 @@ import Data.Char
 import Data.Either
 import Data.List
 import Data.Maybe
+import qualified Data.HashMap.Strict as M
 import Data.Vector (Vector, empty, (!?), fromList)
 import Data.Word
 import Numeric
@@ -29,29 +34,34 @@ import System.Environment
 -- TODO: divide into several modules, and split print and simulate into
 -- separate executables
 -- TODO: add support for labels
+-- TODO: add line numbers to errors
+-- TODO: add instructions to negate flags
+-- TODO: maybe add jge, jle, and jnz, to be translated into negating flags and
+-- the opposite jump
 
-data FlagStatus = Set | Unset deriving (Eq)
+data FlagStatus = Set | Unset deriving (Show, Eq)
 
 newtype RegContent = RegContent {_regContent :: Word8}
-  deriving (Eq, Ord, Integral, Real, Enum, Num, Bits)
+  deriving (Show, Eq, Ord, Integral, Real, Enum, Num, Bits)
 
 makeLenses ''RegContent
 
-data AnsiAttribute =
-  Off | Bold | Underline | Undefined | Italic | BlinkSlow | BlinkRapid | Reverse | Conceal deriving (Enum)
+data AnsiAttribute = Off | Bold | Underline | Undefined | Italic | BlinkSlow
+                   | BlinkRapid | Reverse | Conceal
+                   deriving (Show, Enum)
 
-data AnsiColor =
-  Black | Red | Green | Yellow | Blue | Magenta | Cyan | White deriving (Enum)
+data AnsiColor = Black | Red | Green | Yellow | Blue | Magenta | Cyan | White
+               deriving (Show, Enum)
 
-data Charset = ASCII | Unicode | ANSI
+data Charset = ASCII | Unicode | ANSI deriving Show
 
-data FlagID = Greater | Equal | Less | Carry deriving (Enum, Eq, Ord)
+data FlagID = Greater | Equal | Less | Carry deriving (Show, Enum, Eq, Ord)
 
 data Registers = Registers { _regA :: RegContent
                            , _regB :: RegContent
                            , _regC :: RegContent
                            , _regD :: RegContent
-                           }
+                           } deriving Show
 
 makeLenses ''Registers
 
@@ -59,20 +69,21 @@ data Flags = Flags { _greater :: FlagStatus
                    , _equal   :: FlagStatus
                    , _less    :: FlagStatus
                    , _carry   :: FlagStatus
-                   }
+                   } deriving Show
 
 makeLenses ''Flags
 
 newtype ConstNum = ConstNum Word8
-                   deriving (Enum, Real, Num, Ord, Eq, Integral)
+                   deriving (Show, Enum, Real, Num, Ord, Eq, Integral)
 
-data RegisterID = RegA | RegB | RegC | RegD deriving (Enum)
+data RegisterID = RegA | RegB | RegC | RegD deriving (Show, Enum)
 
-newtype Address = Address Word8 deriving (Enum, Real, Num, Ord, Eq, Integral)
+newtype Address = Address Word8
+                deriving (Show, Enum, Real, Num, Ord, Eq, Integral)
 
-data Alu1Ins = Negate | Not
+data Alu1Ins = Negate | Not deriving Show
 
-data Alu2Ins = Add | ShiftLeft | ShiftRight | And | Or | Xor
+data Alu2Ins = Add | ShiftLeft | ShiftRight | And | Or | Xor deriving Show
 
 data Instruction = ConstTo RegisterID ConstNum
                  | Output RegisterID
@@ -83,45 +94,49 @@ data Instruction = ConstTo RegisterID ConstNum
                  | Alu2 Alu2Ins RegisterID
                  | Nop
                  | Halt
+                 deriving Show
 
-data NumberedInstruction = NIns { _linenumber :: Int
-                                , _instruction :: Instruction
-                                }
+data Numbered a = Numbered { _linenumber :: Int
+                           , _line :: a
+                           } deriving (Show, Functor, Foldable, Traversable)
 
-makeLenses ''NumberedInstruction
+makeLenses ''Numbered
 
 data CPU = CPU { _flags     :: Flags
                , _registers :: Registers
                , _output    :: Word8
-               }
+               } deriving Show
 
 makeLenses ''CPU
 
-data Simulation = Simulation { _lastIns   :: Maybe NumberedInstruction
-                             , _instrs    :: Vector NumberedInstruction
+data Simulation = Simulation { _lastIns   :: Maybe (Numbered Instruction)
+                             , _instrs    :: Vector (Numbered Instruction)
                              , _instrPtr  :: Int
                              , _cpuSteps  :: Integer
                              , _cpu       :: CPU
-                             }
+                             } deriving Show
 
 makeLenses ''Simulation
 
-data Result = Result { _resultIns   :: Maybe NumberedInstruction
+data Result = Result { _resultIns   :: Maybe (Numbered Instruction)
                      , _resultRegs  :: Registers
                      , _leds        :: Word8
                      , _resultFlags :: Flags
                      , _resultSteps :: Integer
-                     }
+                     } deriving Show
 
 makeLenses ''Result
 
 data TerminationReason = Halted
                        | RanOut
                        | StepsReached
+                       deriving Show
 
 data Outcome = Outcome { _reason  :: TerminationReason
                        , _results :: [Result]
-                       }
+                       } deriving Show
+
+type Labels = M.HashMap String Int
 
 makeLenses ''Outcome
 
@@ -143,19 +158,25 @@ flag Equal   = equal
 flag Less    = less
 flag Carry   = carry
 
-strings2Ins :: [String] -> Either String Instruction
-strings2Ins [['c', 't', r], c] | isReg = Right . ConstTo (head reg) =<< readC
-  where isReg = not $ null reg
-        reg = rights . pure . string2Reg $ pure r
+mkError :: Int -> String -> Either String a
+mkError ln str = Left $ "Error in Line " ++ show ln ++ ": " ++ str
+
+strings2Ins :: Labels -> (Int, Numbered [String])
+            -> Either String (Numbered Instruction)
+strings2Ins _ (_, Numbered l [['c', 't', r], c]) | not $ null reg =
+  Numbered l <$> (Right . ConstTo (head reg) =<< readC)
+  where reg = rights . pure . string2Reg l $ pure r
         readC = case c of
           ['0', 'x', a, b] | [(x,"")] <- readHex [a,b] -> Right $ ConstNum x
           (reads -> [(x, "")])
             | x < 256 && x >= -128 -> Right $ ConstNum (fromIntegral x)
-            | otherwise            -> Left $ c ++
+            | otherwise            -> mkError l $ c ++
               " is outside the valid constant range of -128..255"
-          _ -> Left $ show c ++ " is not a valid constant"
-strings2Ins ["out", reg] = Right . Output =<< string2Reg reg
-strings2Ins ['j' : cs, a] | Just j <- jmp = Right . j =<< readA
+          _ -> mkError l $ show c ++ " is not a valid constant"
+strings2Ins _ (_, Numbered l ["out", reg]) = Numbered l <$>
+  (Right . Output =<< string2Reg l reg)
+strings2Ins labels (i, Numbered l ['j' : cs, a]) | Just j <- jmp =
+  Numbered l <$> (Right . j =<< readA)
   where jmp | cs == "mp" = Just Jump
             | otherwise  = lookup cs jumpIfs
         jumpIfs = [ ("e", JumpIf Equal)
@@ -165,13 +186,19 @@ strings2Ins ['j' : cs, a] | Just j <- jmp = Right . j =<< readA
                   , ("c", JumpIf Carry)
                   ]
         readA = case reads a of
-          [(x, "")] | x < 128 && x >= -128 -> Right $ Address (fromIntegral x)
-                    | otherwise            -> Left $ a ++
-                      " is outside the valid address range of -128..127"
-          _ -> Left $ show a ++ " is not a valid address"
-strings2Ins [ins, reg] | ins `elem` ["mov", "cpy"] =
-  Right . CopyFromRegA =<< string2Reg reg
-strings2Ins [ins, reg] | Just i <- alu = Right . i =<< string2Reg reg
+          [(x, "")] -> toAddr x Nothing
+          _ | Just addr <- M.lookup a labels ->
+              Right . Address . fromIntegral $ addr - i
+          _ -> mkError l $ show a ++ " is not a valid address or label"
+        toAddr :: Int -> Maybe String -> Either String Address
+        toAddr addr ms
+          | addr < 128 && addr >= -128 = Right $ Address (fromIntegral addr)
+          | otherwise                  = Left $ fromMaybe (show addr) ms ++
+            " is outside the valid address range of -128..127"
+strings2Ins _ (_, Numbered l [ins, reg]) | ins `elem` ["mov", "cpy"] =
+  Numbered l <$> (Right . CopyFromRegA =<< string2Reg l reg)
+strings2Ins _ (_, Numbered l [ins, reg]) | Just i <- alu =
+  Numbered l <$> (Right . i =<< string2Reg l reg)
   where alu1s = [ ("neg", Negate)
                 , ("not", Not)
                 ]
@@ -186,29 +213,68 @@ strings2Ins [ins, reg] | Just i <- alu = Right . i =<< string2Reg reg
               -> Maybe (RegisterID -> Instruction)
         aluLU a as = a <$> lookup ins as
         alu = aluLU Alu1 alu1s <|> aluLU Alu2 alu2s
-strings2Ins ["nop"] = Right Nop
-strings2Ins ["halt"] = Right Halt
-strings2Ins s = Left $ show (unwords s) ++ " is not a valid Instruction"
+strings2Ins _ (_, Numbered l ["nop"]) = Numbered l <$> Right Nop
+strings2Ins _ (_, Numbered l ["halt"]) = Numbered l <$> Right Halt
+strings2Ins _ (_, Numbered l s) =
+  mkError l $ show (unwords s) ++ " is not a valid instruction"
 
-string2Reg :: String -> Either String RegisterID
-string2Reg "a" = Right RegA
-string2Reg "b" = Right RegB
-string2Reg "c" = Right RegC
-string2Reg "d" = Right RegD
-string2Reg s = Left $ "No register named " ++ show s
+string2Reg :: Int -> String -> Either String RegisterID
+string2Reg _ "a" = Right RegA
+string2Reg _ "b" = Right RegB
+string2Reg _ "c" = Right RegC
+string2Reg _ "d" = Right RegD
+string2Reg l s = mkError l $ "No register named " ++ show s
 
-lines2Inss :: [String] -> Either String [Maybe Instruction]
-lines2Inss = (fmap . fmap . fmap . fmap) (view instruction) lines2NInss
--- Just look at this beast ^
+getIns :: [String] -> Either String [Instruction]
+getIns = (fmap (^.line) <$>) . getNumIns
 
-lines2NInss :: [String] -> Either String [Maybe NumberedInstruction]
-lines2NInss = zipWithM (\lnu -> ((fmap . fmap) (NIns lnu)) .
-    (traverse (strings2Ins . words) . emptyLine . takeWhile (/= ';'))) [1..]
-    where emptyLine l | all isSpace l = Nothing
-                      | otherwise     = Just l
+getNumIns :: [String] -> Either String [Numbered Instruction]
+getNumIns ss = getInsLines ss >>=
+  (\(labels, ns) -> traverse (strings2Ins labels . fmap (words <$>)) ns)
+
+-- returns lines that actually contain instruction along with the line number
+getInsLines :: [String] -> Either String (Labels, [(Int, Numbered String)])
+getInsLines ss = (,fmap (uncurry Numbered) <$> ins) <$>
+  assignLbls lbls ins M.empty
+  where
+    (lbls, ins) = bimap (fmap init <$>) (zip [0..]) .
+      distribute (isLabel . snd) .
+      filter (not . null . snd) .
+      (fmap (strip . takeWhile (/= ';')) <$>) $
+      zip [1..] ss
+
+    maxI = succ . maximum $ map fst ins
+
+    assignLbls :: [(Int, String)] -> [(Int, (Int, String))] -> Labels
+           -> Either String Labels
+    assignLbls lbl@((n, l):ls) is@((_, (m, _)):is'@((x, (o, _)):_)) lblm
+      | m < n, n <= o = assignLbls ls is =<< insertLabel n l x lblm
+      | otherwise = assignLbls lbl is' lblm
+    assignLbls lbl@((n, l):ls) is@[(x, (o, _))] lblm
+      | n <= o = assignLbls ls is =<< insertLabel n l x lblm
+      | otherwise = assignLbls lbl [] lblm
+    assignLbls ((n, l):ls) [] lblm =
+      assignLbls ls [] =<< insertLabel n l maxI lblm
+    assignLbls [] _ lblm = Right lblm
+
+    insertLabel :: Int -> String -> Int -> Labels -> Either String Labels
+    insertLabel n lbl x lblm
+      | lbl `M.member` lblm = mkError n $ "Duplicate label " ++ show lbl
+      | otherwise = Right $ M.insert lbl x lblm
+
+    strip = let f = dropWhile isSpace . reverse in f . f
+    isLabel (x:xs) -- this is what I get for not using a parsing library
+      | isAlpha x, all isAlphaNum $ init xs, last xs == ':' = True
+    isLabel _ = False
+
+distribute :: (a -> Bool) -> [a] -> ([a], [a])
+distribute p l = bimap reverse reverse $ go l [] []
+  where go [] ts fs = (ts, fs)
+        go (x:xs) ts fs | p x       = go xs (x:ts) fs
+                        | otherwise = go xs ts (x:fs)
 
 ins2Hex :: Bool -> Instruction -> String
-ins2Hex binary = (if binary then hexToBin else id) . go
+ins2Hex binary = (if binary then unsafeHexToBin else id) . go
   where
     go (ConstTo r c) = "1" ++ reg2Hex r ++ two0 (showHex (fromIntegral c) "")
     go (Output r) = "1" ++ showHex (fromEnum r + 8) "00"
@@ -239,35 +305,56 @@ ins2Hex binary = (if binary then hexToBin else id) . go
     alu2Ins2Hex Or         = "4"
     alu2Ins2Hex Xor        = "5"
 
--- Careful: prints out an error if the input isn't actually hex
-hexToBin :: String -> String
-hexToBin s = case readInt 16 isHexDigit digitToInt s of
-  [(n, "")] -> let s' = showIntAtBase 2 intToDigit n ""
-               in replicate (4 * length s - length s') '0' ++ s'
-  _ -> error $ "Main.hextoBin: tried to read " ++ show s ++ " as a hex number"
+unsafeHexToBin :: String -> String
+unsafeHexToBin =
+  intercalate " " . map ((sequence (replicate 4 "01") !!) . digitToInt)
 
-appendOriginal :: Bool -> [String] -> [Maybe Instruction] -> [String]
-appendOriginal binary ls ms =
-  zipWith ((++) . (++ "    ") . fromMaybe "    ") hexs ls
-  where hexs = map (fmap (ins2Hex binary)) ms
+lineNumber :: Bool -> Int -> Numbered a -> String
+lineNumber numbers maxline (Numbered n _) | numbers   = nu ++ ": "
+                                          | otherwise = ""
+  where str = show n
+        nu = replicate (length (show maxline) - length str) ' ' ++ str
 
-printAsmAndOrig :: Bool -> String -> IO ()
-printAsmAndOrig binary file = do
+appendOriginal :: Bool -> Bool -> Int -> [String] -> [Numbered Instruction]
+               -> [String]
+appendOriginal numbers binary maxline ls is =
+  zipWith (\nb ->
+           ((lineNumber numbers maxline nb ++ nb^.line ++ "    ") ++)) hexs ls
+  where hexs :: [Numbered String]
+        hexs = fill $ fmap (ins2Hex binary) <$> is
+        fill :: [Numbered String] -> [Numbered String]
+        fill ns@(Numbered n _ : _) =
+          map (flip Numbered filler) [1..n-1] ++ go ns
+        fill ns = ns
+        go :: [Numbered String] -> [Numbered String]
+        go (Numbered n@(succ -> n') i : rest@(Numbered m _ : _))
+          | n' < m    = Numbered n i : go (Numbered n' filler : rest)
+          | otherwise = Numbered n i : go rest
+        go [nb@(Numbered n _)] =
+          nb : map (flip Numbered filler) [succ n..maxline]
+        go [] = []
+        filler = replicate (if binary then 19 else 4) ' '
+
+printAsmAndOrig :: Bool -> Bool -> String -> IO ()
+printAsmAndOrig numbers binary file = do
   content <- lines <$> readFile file
-  mapM_ putStrLn . either pure (appendOriginal binary content) $
-    lines2Inss content
+  mapM_ putStrLn .
+    either pure (appendOriginal numbers binary (length content) content) $
+    getNumIns content
 
-printAsm :: Bool -> String -> IO ()
-printAsm binary file = do
+printAsm :: Bool -> Bool -> String -> IO ()
+printAsm numbers binary file = do
   content <- lines <$> readFile file
-  mapM_ putStrLn . either pure (map (ins2Hex binary) . catMaybes) $
-    lines2Inss content
+  mapM_ putStrLn . either pure
+    ((((++) . lineNumber numbers (length content)) <*> view line <$>) .
+      (fmap (ins2Hex binary) <$>)) $
+    getNumIns content
 
 printLogisim :: Bool -> String -> IO ()
 printLogisim binary file = do
   content <- lines <$> readFile file
-  putStrLn . ("v2.0 raw\n" ++) . unlines .
-    either pure (map (ins2Hex binary) . catMaybes) $ lines2Inss content
+  mapM_ putStrLn . ("v2.0 raw" :) .
+    either pure (ins2Hex binary <$>) $ getIns content
 
 simulate :: Maybe Int -> State Simulation Outcome
 simulate msteps =
@@ -277,7 +364,7 @@ simulate msteps =
        ind <- use instrPtr
        case ins !? ind of
          Nothing -> end RanOut
-         mni@(Just (view instruction -> i)) -> do
+         mni@(Just (view line -> i)) -> do
            cpuSteps += 1
            instrPtr += 1
            eval i
@@ -355,8 +442,8 @@ simResult ss = Result { _resultIns   = ss^.lastIns
                       , _resultSteps = ss^.cpuSteps
                       }
 
-prettyNIns :: NumberedInstruction -> String
-prettyNIns (NIns ln ins) = (show ln ++ ": ") ++ prettyIns ins
+prettyNIns :: (Numbered Instruction) -> String
+prettyNIns (Numbered ln ins) = (show ln ++ ": ") ++ prettyIns ins
 
 prettyIns :: Instruction -> String
 prettyIns (ConstTo r c)    = "ct" ++ prettyReg r ++ " " ++ prettyConst c
@@ -431,9 +518,9 @@ ansiCustom chs fmt s = case chs of
 prettyResult :: Charset -> Result -> String
 prettyResult
   chs (Result li (map (^.regContent) . listRegisters -> regs) ls fs steps) =
-  line False ++
+  hline False ++
   lastI ++
-  line True ++
+  hline True ++
   regLine True ++
   regsHex ++
   regsU ++
@@ -493,12 +580,16 @@ prettyResult
                                  [Unset, Set  , Set  ] -> ">="
                                  [Unset, Unset, Unset] -> "  "
                                  _                     -> " E"
-          _ -> concat $
+          Unicode -> zipWith (\f c -> case f of
+                               Set -> c
+                               _   -> ' ') flagStates letters
+          ANSI -> concat $
             zipWith (\f c -> (ansiFg $ case f of
                       Set -> White
                       _   -> Black) [c])
-                    flagStates "GELC"
+                    flagStates letters
           where flagStates = map ((fs^.) . flag) [Greater ..]
+                letters = "GELC"
         lights = insertSpace (map applyEnc $
           nChar '0' 8 $ showIntAtBase 2 ("01" !!) ls "")
         hex = "0x" ++ bw (nChar '0' 2 $ showHex ls "")
@@ -521,9 +612,9 @@ prettyResult
     br n = (++ asciiUni "\n" (ansiFg Cyan $ replicate n ' ' ++ "┃\n"))
     insertSpace (a:b:c:d:r) = concat $ a:b:c:d:" ":r
     insertSpace xs = concat xs
-    line b | b            = ln '┠' '─' '┨'
-           | isNothing li = ""
-           | otherwise    = ln '┣' '━' '┫'
+    hline b | b            = ln '┠' '─' '┨'
+            | isNothing li = ""
+            | otherwise    = ln '┣' '━' '┫'
       where
         ln l c r = asciiUni lineASCII (lineUni l c r)
         lineASCII | b = replicate 50 '-' ++ "\n\n"
@@ -555,9 +646,9 @@ defaultCPU = CPU
 runSimulation :: Maybe Int -> Charset -> String -> IO ()
 runSimulation msteps chs file = do
   content <- lines <$> readFile file
-  either putStrLn (putStr . run . catMaybes) $ lines2NInss content
+  either putStrLn (putStr . run) $ getNumIns content
   where
-    run :: [NumberedInstruction] -> String
+    run :: [Numbered Instruction] -> String
     run is = prettyResults chs . outcome . (set instrs ?? defaultSimulation) $
       fromList is
     outcome :: Simulation -> Outcome
@@ -581,6 +672,7 @@ data PrintOptions = PrintOptions
   { optLogisim  :: Bool
   , optAssembly :: Bool
   , optBinary :: Bool
+  , optNumbers :: Bool
   }
 
 instance Options PrintOptions where
@@ -591,6 +683,8 @@ instance Options PrintOptions where
         "Whether to print out the assembly code, when --logisim is off"
     <*> boolOption "binary" 'b'
         "Whether to print in binary, when --logisim is off"
+    <*> boolOption "numbers" 'n'
+        "Whether to print out line numbers, when --logisim is off"
 
 data SimulateOptions = SimulateOptions
   { optUnicode :: Bool
@@ -618,9 +712,10 @@ checkFilename _ _ = putStrLn . usage =<< getProgName
 runPrint :: MainOptions -> PrintOptions -> [String] -> IO ()
 runPrint _ opts args = checkFilename go args
   where go | optLogisim  opts = printLogisim binary
-           | optAssembly opts = printAsmAndOrig binary
-           | otherwise        = printAsm binary
+           | optAssembly opts = printAsmAndOrig numbers binary
+           | otherwise        = printAsm numbers binary
         binary = optBinary opts
+        numbers = optNumbers opts
 
 runSimulate :: MainOptions -> SimulateOptions -> [String] -> IO ()
 runSimulate _ opts args = checkFilename go args

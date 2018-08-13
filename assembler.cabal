@@ -27,6 +27,7 @@ executable assembler
                      , assembler
                      , mtl >= 2.2 && < 3
                      , containers >= 0.5 && < 1
+                     , unordered-containers >= 0.2 && < 1
                      , lens >= 4.15 && < 5
                      , vector >= 0.12 && < 1
                      , options >= 1.2 && < 2
